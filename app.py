@@ -1,14 +1,12 @@
 from flask import Flask, request, jsonify, render_template_string
+from twilio.rest import Client
 import os
 
 app = Flask(__name__)
 
-# =============================
-# DEMO DATA
-# No SQL
-# No file handling
-# =============================
-
+# -----------------------------
+# OWNER DATA
+# -----------------------------
 owner = {
     "name": "",
     "phone": "",
@@ -17,999 +15,604 @@ owner = {
     "device_id": ""
 }
 
-status = {
+# -----------------------------
+# FIRE STATUS
+# -----------------------------
+fire_status = {
     "fire": False,
-    "temperature": 28,
-    "flame": "NOT DETECTED",
-    "extinguisher": "READY",
-    "device_online": True
+    "flame": "SAFE",
+    "temperature": 0,
+    "extinguisher": "OFF",
+    "sms_sent": False
 }
 
 
-# =============================
-# WEBSITE
-# =============================
+# -----------------------------
+# SEND SMS
+# -----------------------------
+def send_sms(phone_number):
+    try:
+        account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+        auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+        twilio_number = os.environ.get("TWILIO_PHONE_NUMBER")
 
+        # Check that Twilio settings exist
+        if not account_sid or not auth_token or not twilio_number:
+            print("Twilio environment variables are missing.")
+            return False
+
+        client = Client(account_sid, auth_token)
+
+        message = client.messages.create(
+            body=(
+                "FIRE ALERT!\n"
+                "Smart Fire Guard detected a possible fire.\n"
+                "Please check the location immediately."
+            ),
+            from_=twilio_number,
+            to=phone_number
+        )
+
+        print("SMS sent:", message.sid)
+        return True
+
+    except Exception as e:
+        print("SMS ERROR:", e)
+        return False
+
+
+# -----------------------------
+# WEBSITE
+# -----------------------------
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-
-    <meta charset="UTF-8">
-    <meta name="viewport"
-          content="width=device-width, initial-scale=1.0">
-
     <title>Smart Fire Guard</title>
+
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1">
 
     <style>
 
         * {
             box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-            font-family: Arial, sans-serif;
         }
 
         body {
-            background: #0b1220;
-            color: white;
-        }
-
-        .container {
-            width: 92%;
-            max-width: 1100px;
-            margin: auto;
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f4f8ff;
+            color: #172033;
         }
 
         header {
-            padding: 20px 0;
-            border-bottom: 1px solid #26344d;
-        }
-
-        nav {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .logo {
-            font-size: 24px;
-            font-weight: bold;
-        }
-
-        .logo span {
-            color: #ff4b3e;
-        }
-
-        .hero {
+            background: #ffffff;
+            border-bottom: 4px solid #1677ff;
+            padding: 20px;
             text-align: center;
-            padding: 70px 10px;
         }
 
-        .hero h1 {
-            font-size: 60px;
-            margin-bottom: 15px;
+        header h1 {
+            margin: 0;
+            color: #1677ff;
         }
 
-        .hero h1 span {
-            color: #ff4b3e;
+        header p {
+            margin: 7px 0 0;
+            color: #555;
         }
 
-        .hero p {
-            color: #aebbd0;
-            font-size: 18px;
-            line-height: 1.6;
-        }
-
-        .button {
-            border: none;
-            border-radius: 10px;
-            padding: 13px 20px;
-            margin-top: 20px;
-            background: #ff4b3e;
-            color: white;
-            font-weight: bold;
-            cursor: pointer;
-        }
-
-        .button:hover {
-            opacity: 0.85;
-        }
-
-        .section {
-            margin: 35px 0;
+        .container {
+            max-width: 1000px;
+            margin: auto;
+            padding: 20px;
         }
 
         .card {
-            background: #121c2e;
-            border: 1px solid #26344d;
-            border-radius: 16px;
-            padding: 25px;
+            background: white;
+            border: 2px solid #1677ff;
+            border-radius: 15px;
+            padding: 20px;
             margin-bottom: 20px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.08);
         }
 
         h2 {
-            margin-bottom: 20px;
-        }
-
-        form {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 15px;
+            color: #1677ff;
         }
 
         input {
             width: 100%;
             padding: 13px;
+            margin: 7px 0 12px;
+            border: 1px solid #bbb;
             border-radius: 8px;
-            border: 1px solid #34435e;
-            background: #0b1220;
+            font-size: 16px;
+        }
+
+        button {
+            padding: 12px 18px;
+            border: none;
+            border-radius: 8px;
+            background: #1677ff;
             color: white;
+            font-size: 16px;
+            cursor: pointer;
+            margin: 5px;
         }
 
-        .full {
-            grid-column: 1 / -1;
-        }
-
-        .dashboard {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 15px;
-        }
-
-        .status-card {
-            background: #121c2e;
-            border: 1px solid #26344d;
-            border-radius: 14px;
-            padding: 22px;
-            text-align: center;
-        }
-
-        .status-card h3 {
-            color: #9eacc1;
-            font-size: 14px;
-            margin-bottom: 10px;
-        }
-
-        .value {
-            font-size: 22px;
-            font-weight: bold;
-        }
-
-        .safe {
-            color: #39d98a;
+        button:hover {
+            opacity: 0.85;
         }
 
         .danger {
-            color: #ff4b3e;
+            background: #e53935;
         }
 
-        .alert {
-            display: none;
-            background: #4a1717;
-            border: 1px solid #ff4b3e;
-            border-radius: 14px;
-            padding: 25px;
-            margin-top: 20px;
+        .safe {
+            background: #20a050;
+        }
+
+        .status {
+            padding: 20px;
+            border-radius: 12px;
             text-align: center;
+            font-size: 22px;
+            font-weight: bold;
+            background: #e8fff0;
+            color: #16833c;
         }
 
-        .alert h2 {
-            color: #ff6b61;
+        .fire {
+            background: #ffe5e5;
+            color: #d00000;
         }
 
-        .info {
-            color: #aebbd0;
-            line-height: 1.7;
-        }
-
-        .steps {
+        .grid {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
+            grid-template-columns:
+                repeat(auto-fit, minmax(200px, 1fr));
             gap: 15px;
         }
 
-        .step {
-            background: #121c2e;
-            border: 1px solid #26344d;
-            border-radius: 14px;
-            padding: 20px;
-            text-align: center;
+        .box {
+            background: #f7f9fc;
+            padding: 15px;
+            border-radius: 10px;
+            border: 1px solid #ddd;
+        }
+
+        .value {
+            font-size: 25px;
+            font-weight: bold;
+            margin-top: 5px;
         }
 
         footer {
             text-align: center;
-            padding: 35px 0;
-            color: #71809a;
-        }
-
-        @media(max-width: 750px) {
-
-            form,
-            .dashboard,
-            .steps {
-                grid-template-columns: 1fr;
-            }
-
-            .full {
-                grid-column: auto;
-            }
-
-            .hero h1 {
-                font-size: 40px;
-            }
+            padding: 20px;
+            color: #666;
         }
 
     </style>
-
 </head>
 
 <body>
 
-
 <header>
-
-    <div class="container">
-
-        <nav>
-
-            <div class="logo">
-                SMART <span>FIRE</span> GUARD
-            </div>
-
-            <div>
-                🔥 Safety System
-            </div>
-
-        </nav>
-
-    </div>
-
+    <h1>🔥 SMART FIRE GUARD</h1>
+    <p>Automatic Fire Detection & Alert System</p>
 </header>
 
+<div class="container">
 
-<!-- HERO -->
+    <!-- OWNER REGISTRATION -->
+    <div class="card">
 
-<section class="hero">
+        <h2>👤 Owner Registration</h2>
 
-    <div class="container">
+        <input id="name"
+               placeholder="Owner Name">
 
-        <h1>
-            SMART <span>FIRE</span> GUARD
-        </h1>
+        <input id="phone"
+               placeholder="Phone Number (+91...)">
 
-        <p>
-            Automatic fire monitoring and warning system.
-            Detect fire, activate safety system and warn
-            the registered owner.
-        </p>
+        <input id="email"
+               placeholder="Email Address">
 
-        <button
-            class="button"
-            onclick="document.getElementById('register').scrollIntoView({behavior:'smooth'})">
+        <input id="location"
+               placeholder="Fire Guard Location">
 
-            REGISTER OWNER
+        <input id="device"
+               placeholder="Device ID">
 
+        <button onclick="registerOwner()">
+            Register Owner
         </button>
 
+        <p id="registerMessage"></p>
+
     </div>
 
-</section>
 
+    <!-- FIRE STATUS -->
+    <div class="card">
 
-<!-- OWNER REGISTRATION -->
+        <h2>🚨 System Status</h2>
 
-<section class="section" id="register">
+        <div id="status"
+             class="status">
 
-    <div class="container">
-
-        <div class="card">
-
-            <h2>
-                👤 Register Owner
-            </h2>
-
-            <form id="registerForm">
-
-                <input
-                    id="name"
-                    placeholder="Owner Name"
-                    required>
-
-                <input
-                    id="phone"
-                    placeholder="Phone Number"
-                    required>
-
-                <input
-                    id="email"
-                    type="email"
-                    placeholder="Email Address">
-
-                <input
-                    id="location"
-                    placeholder="House / Location"
-                    required>
-
-                <input
-                    id="device_id"
-                    class="full"
-                    placeholder="Fire Guard Device ID"
-                    required>
-
-                <button
-                    class="button full"
-                    type="submit">
-
-                    SAVE REGISTRATION
-
-                </button>
-
-            </form>
-
-            <p
-                id="registerMessage"
-                class="info"
-                style="margin-top:15px;">
-            </p>
+            System is SAFE
 
         </div>
 
     </div>
 
-</section>
 
+    <!-- SENSOR DATA -->
+    <div class="card">
 
-<!-- DASHBOARD -->
+        <h2>📊 Sensor Information</h2>
 
-<section class="section">
+        <div class="grid">
 
-    <div class="container">
-
-        <div class="card">
-
-            <h2>
-                📊 Live Safety Dashboard
-            </h2>
-
-            <div class="dashboard">
-
-
-                <div class="status-card">
-
-                    <h3>
-                        TEMPERATURE
-                    </h3>
-
-                    <div
-                        id="temperature"
-                        class="value">
-
-                        -- °C
-
-                    </div>
-
+            <div class="box">
+                Flame
+                <div id="flame"
+                     class="value">
+                    SAFE
                 </div>
-
-
-                <div class="status-card">
-
-                    <h3>
-                        FLAME SENSOR
-                    </h3>
-
-                    <div
-                        id="flame"
-                        class="value safe">
-
-                        --
-
-                    </div>
-
-                </div>
-
-
-                <div class="status-card">
-
-                    <h3>
-                        EXTINGUISHER
-                    </h3>
-
-                    <div
-                        id="extinguisher"
-                        class="value safe">
-
-                        --
-
-                    </div>
-
-                </div>
-
-
-                <div class="status-card">
-
-                    <h3>
-                        DEVICE
-                    </h3>
-
-                    <div
-                        id="device"
-                        class="value safe">
-
-                        --
-
-                    </div>
-
-                </div>
-
             </div>
 
-
-            <!-- FIRE ALERT -->
-
-            <div
-                id="fireAlert"
-                class="alert">
-
-                <h2>
-                    🚨 FIRE ALERT!
-                </h2>
-
-                <p>
-                    A possible fire has been detected.
-                </p>
-
-                <p
-                    id="ownerAlert"
-                    style="margin-top:10px;">
-                </p>
-
+            <div class="box">
+                Temperature
+                <div id="temperature"
+                     class="value">
+                    0 °C
+                </div>
             </div>
 
+            <div class="box">
+                Extinguisher
+                <div id="extinguisher"
+                     class="value">
+                    OFF
+                </div>
+            </div>
 
-            <!-- TEST BUTTONS -->
-
-            <div style="text-align:center;">
-
-                <button
-                    class="button"
-                    onclick="testFire()">
-
-                    TEST FIRE ALERT
-
-                </button>
-
-
-                <button
-                    class="button"
-                    style="background:#33435e;"
-                    onclick="resetSystem()">
-
-                    RESET TO SAFE
-
-                </button>
-
+            <div class="box">
+                SMS
+                <div id="sms"
+                     class="value">
+                    NOT SENT
+                </div>
             </div>
 
         </div>
 
     </div>
 
-</section>
 
+    <!-- DEMO CONTROLS -->
+    <div class="card">
 
-<!-- HOW IT WORKS -->
+        <h2>🧪 Demonstration</h2>
 
-<section class="section">
+        <p>
+            Use these buttons to test the website.
+            Do not use real fire for testing.
+        </p>
 
-    <div class="container">
+        <button class="danger"
+                onclick="testFire()">
+            🔥 Test Fire
+        </button>
 
-        <div class="card">
+        <button class="safe"
+                onclick="resetSystem()">
+            ✅ Reset System
+        </button>
 
-            <h2>
-                ⚙️ How It Works
-            </h2>
-
-            <div class="steps">
-
-
-                <div class="step">
-
-                    <h3>
-                        🔥 Sensor
-                    </h3>
-
-                    <p class="info">
-                        Detects flame or abnormal temperature.
-                    </p>
-
-                </div>
-
-
-                <div class="step">
-
-                    <h3>
-                        📡 ESP32
-                    </h3>
-
-                    <p class="info">
-                        Sends safety information through Wi-Fi.
-                    </p>
-
-                </div>
-
-
-                <div class="step">
-
-                    <h3>
-                        ☁️ Server
-                    </h3>
-
-                    <p class="info">
-                        Receives and processes the fire alert.
-                    </p>
-
-                </div>
-
-
-                <div class="step">
-
-                    <h3>
-                        📱 Owner
-                    </h3>
-
-                    <p class="info">
-                        The registered owner is warned.
-                    </p>
-
-                </div>
-
-            </div>
-
-        </div>
+        <p id="message"></p>
 
     </div>
 
-</section>
+</div>
 
 
 <footer>
-
-    Smart Fire Guard — School Project Prototype
-
+    Smart Fire Guard © 2026
 </footer>
 
 
 <script>
 
+async function registerOwner() {
 
-// =============================
-// LOAD STATUS
-// =============================
+    const data = {
 
-async function loadStatus() {
+        name: document.getElementById("name").value,
+        phone: document.getElementById("phone").value,
+        email: document.getElementById("email").value,
+        location: document.getElementById("location").value,
+        device_id: document.getElementById("device").value
 
-    try {
+    };
 
-        const response =
-            await fetch("/status");
+    const response = await fetch("/register", {
 
-        const data =
-            await response.json();
+        method: "POST",
 
+        headers: {
+            "Content-Type": "application/json"
+        },
 
-        document.getElementById(
-            "temperature"
-        ).innerText =
-            data.temperature + " °C";
+        body: JSON.stringify(data)
 
+    });
 
-        document.getElementById(
-            "flame"
-        ).innerText =
-            data.flame;
+    const result = await response.json();
 
-
-        document.getElementById(
-            "extinguisher"
-        ).innerText =
-            data.extinguisher;
-
-
-        document.getElementById(
-            "device"
-        ).innerText =
-            data.device_online
-            ? "ONLINE"
-            : "OFFLINE";
-
-
-        const flame =
-            document.getElementById("flame");
-
-        const extinguisher =
-            document.getElementById("extinguisher");
-
-        const device =
-            document.getElementById("device");
-
-        const alertBox =
-            document.getElementById("fireAlert");
-
-
-        if (data.fire) {
-
-            flame.className =
-                "value danger";
-
-            extinguisher.className =
-                "value danger";
-
-            alertBox.style.display =
-                "block";
-
-            document.getElementById(
-                "ownerAlert"
-            ).innerText =
-                "Warning generated for the registered owner.";
-
-        }
-
-        else {
-
-            flame.className =
-                "value safe";
-
-            extinguisher.className =
-                "value safe";
-
-            alertBox.style.display =
-                "none";
-
-        }
-
-
-        device.className =
-            data.device_online
-            ? "value safe"
-            : "value danger";
-
-    }
-
-    catch(error) {
-
-        console.log(error);
-
-    }
-
+    document.getElementById("registerMessage")
+        .innerText = result.message;
 }
 
-
-// =============================
-// REGISTER OWNER
-// =============================
-
-document.getElementById(
-    "registerForm"
-).addEventListener(
-    "submit",
-    async function(event) {
-
-        event.preventDefault();
-
-
-        const data = {
-
-            name:
-                document.getElementById(
-                    "name"
-                ).value,
-
-            phone:
-                document.getElementById(
-                    "phone"
-                ).value,
-
-            email:
-                document.getElementById(
-                    "email"
-                ).value,
-
-            location:
-                document.getElementById(
-                    "location"
-                ).value,
-
-            device_id:
-                document.getElementById(
-                    "device_id"
-                ).value
-
-        };
-
-
-        const response =
-            await fetch(
-                "/register",
-                {
-                    method: "POST",
-
-                    headers: {
-                        "Content-Type":
-                            "application/json"
-                    },
-
-                    body:
-                        JSON.stringify(data)
-                }
-            );
-
-
-        const result =
-            await response.json();
-
-
-        document.getElementById(
-            "registerMessage"
-        ).innerText =
-            result.message;
-
-    }
-);
-
-
-// =============================
-// TEST FIRE
-// =============================
 
 async function testFire() {
 
-    await fetch(
-        "/api/test-fire",
-        {
+    const response =
+        await fetch("/api/test-fire", {
             method: "POST"
-        }
-    );
+        });
 
-    loadStatus();
+    const result = await response.json();
 
+    document.getElementById("message")
+        .innerText = result.message;
+
+    updateStatus();
 }
 
-
-// =============================
-// RESET
-// =============================
 
 async function resetSystem() {
 
-    await fetch(
-        "/api/reset",
-        {
+    const response =
+        await fetch("/api/reset", {
             method: "POST"
-        }
-    );
+        });
 
-    loadStatus();
+    const result = await response.json();
 
+    document.getElementById("message")
+        .innerText = result.message;
+
+    updateStatus();
 }
 
 
-// Update every 2 seconds
+async function updateStatus() {
 
-loadStatus();
+    const response =
+        await fetch("/status");
 
-setInterval(
-    loadStatus,
-    2000
-);
+    const data =
+        await response.json();
+
+
+    const status =
+        document.getElementById("status");
+
+
+    if (data.fire === true) {
+
+        status.innerText =
+            "🚨 FIRE DETECTED!";
+
+        status.className =
+            "status fire";
+
+    } else {
+
+        status.innerText =
+            "✅ SYSTEM IS SAFE";
+
+        status.className =
+            "status";
+
+    }
+
+
+    document.getElementById("flame")
+        .innerText = data.flame;
+
+
+    document.getElementById("temperature")
+        .innerText =
+        data.temperature + " °C";
+
+
+    document.getElementById("extinguisher")
+        .innerText =
+        data.extinguisher;
+
+
+    document.getElementById("sms")
+        .innerText =
+        data.sms_sent
+        ? "SENT"
+        : "NOT SENT";
+}
+
+
+setInterval(updateStatus, 3000);
+
+updateStatus();
 
 </script>
-
 
 </body>
 </html>
 """
 
 
-# =============================
-# HOME
-# =============================
-
+# -----------------------------
+# HOME PAGE
+# -----------------------------
 @app.route("/")
 def home():
-
     return render_template_string(HTML)
 
 
-# =============================
+# -----------------------------
 # REGISTER OWNER
-# =============================
-
+# -----------------------------
 @app.route("/register", methods=["POST"])
 def register():
 
-    data = request.get_json(
-        silent=True
-    ) or {}
+    data = request.get_json()
 
+    if not data:
+        return jsonify({
+            "success": False,
+            "message": "No registration data received."
+        }), 400
 
-    owner["name"] = data.get(
-        "name",
-        ""
-    ).strip()
+    owner["name"] = data.get("name", "").strip()
+    owner["phone"] = data.get("phone", "").strip()
+    owner["email"] = data.get("email", "").strip()
+    owner["location"] = data.get("location", "").strip()
+    owner["device_id"] = data.get("device_id", "").strip()
 
-
-    owner["phone"] = data.get(
-        "phone",
-        ""
-    ).strip()
-
-
-    owner["email"] = data.get(
-        "email",
-        ""
-    ).strip()
-
-
-    owner["location"] = data.get(
-        "location",
-        ""
-    ).strip()
-
-
-    owner["device_id"] = data.get(
-        "device_id",
-        ""
-    ).strip()
-
+    if not owner["name"] or not owner["phone"]:
+        return jsonify({
+            "success": False,
+            "message": "Name and phone number are required."
+        }), 400
 
     return jsonify({
-
         "success": True,
-
-        "message":
-            "Owner registered successfully!"
-
+        "message": "Owner registered successfully!"
     })
 
 
-# =============================
+# -----------------------------
 # GET SYSTEM STATUS
-# =============================
-
-@app.route("/status")
-def get_status():
-
-    return jsonify(status)
-
-
-# =============================
-# ESP32 FIRE API
-# =============================
-
-@app.route(
-    "/api/fire",
-    methods=["POST"]
-)
-def fire_event():
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-
-    fire = bool(
-        data.get(
-            "fire",
-            False
-        )
-    )
-
-
-    status["fire"] = fire
-
-
-    status["temperature"] = data.get(
-        "temperature",
-        82 if fire else 28
-    )
-
-
-    status["flame"] = data.get(
-        "flame",
-        "DETECTED"
-        if fire
-        else "NOT DETECTED"
-    )
-
-
-    status["extinguisher"] = (
-        "ACTIVATED"
-        if fire
-        else "READY"
-    )
-
+# -----------------------------
+@app.route("/status", methods=["GET"])
+def status():
 
     return jsonify({
-
-        "success": True,
-
-        "message":
-            "Fire status received"
-
+        "fire": fire_status["fire"],
+        "flame": fire_status["flame"],
+        "temperature": fire_status["temperature"],
+        "extinguisher": fire_status["extinguisher"],
+        "sms_sent": fire_status["sms_sent"],
+        "owner": owner["name"]
     })
 
 
-# =============================
-# TEST FIRE
-# =============================
+# -----------------------------
+# ESP8266 FIRE API
+# -----------------------------
+@app.route("/api/fire", methods=["POST"])
+def fire_api():
 
-@app.route(
-    "/api/test-fire",
-    methods=["POST"]
-)
+    data = request.get_json(silent=True) or {}
+
+    fire = data.get("fire", False)
+    flame = data.get("flame", "DETECTED")
+    temperature = data.get("temperature", 82)
+
+    # Fire detected
+    if fire:
+
+        fire_status["fire"] = True
+        fire_status["flame"] = "DETECTED"
+        fire_status["temperature"] = temperature
+        fire_status["extinguisher"] = "ACTIVATED"
+
+        # Send only ONE SMS until system is reset
+        if not fire_status["sms_sent"]:
+
+            if owner["phone"]:
+
+                success = send_sms(owner["phone"])
+
+                if success:
+                    fire_status["sms_sent"] = True
+
+        return jsonify({
+            "success": True,
+            "fire": True,
+            "message": "Fire detected. Extinguisher activated."
+        })
+
+    # No fire
+    fire_status["fire"] = False
+    fire_status["flame"] = flame
+    fire_status["temperature"] = temperature
+    fire_status["extinguisher"] = "OFF"
+
+    return jsonify({
+        "success": True,
+        "fire": False,
+        "message": "System is safe."
+    })
+
+
+# -----------------------------
+# TEST FIRE
+# -----------------------------
+@app.route("/api/test-fire", methods=["POST"])
 def test_fire():
 
-    status["fire"] = True
+    fire_status["fire"] = True
+    fire_status["flame"] = "DETECTED"
+    fire_status["temperature"] = 82
+    fire_status["extinguisher"] = "ACTIVATED"
 
-    status["temperature"] = 82
+    # Send SMS
+    if not fire_status["sms_sent"] and owner["phone"]:
 
-    status["flame"] = "DETECTED"
+        success = send_sms(owner["phone"])
 
-    status["extinguisher"] = "ACTIVATED"
-
+        if success:
+            fire_status["sms_sent"] = True
 
     return jsonify({
-
         "success": True,
-
-        "message":
-            "Test fire alert activated"
-
+        "message": "Test fire activated."
     })
 
 
-# =============================
+# -----------------------------
 # RESET SYSTEM
-# =============================
-
-@app.route(
-    "/api/reset",
-    methods=["POST"]
-)
+# -----------------------------
+@app.route("/api/reset", methods=["POST"])
 def reset():
 
-    status["fire"] = False
+    fire_status["fire"] = False
+    fire_status["flame"] = "SAFE"
+    fire_status["temperature"] = 0
+    fire_status["extinguisher"] = "OFF"
 
-    status["temperature"] = 28
-
-    status["flame"] = "NOT DETECTED"
-
-    status["extinguisher"] = "READY"
-
+    # Allow SMS to be sent again
+    fire_status["sms_sent"] = False
 
     return jsonify({
-
         "success": True,
-
-        "message":
-            "System reset to safe"
-
+        "message": "System reset successfully."
     })
 
 
-# =============================
+# -----------------------------
 # RUN SERVER
-# =============================
-
+# -----------------------------
 if __name__ == "__main__":
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            5000
-        )
-    )
+    port = int(os.environ.get("PORT", 5000))
 
     app.run(
         host="0.0.0.0",
