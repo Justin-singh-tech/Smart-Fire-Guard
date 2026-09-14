@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template_string
+ from flask import Flask, request, jsonify, render_template_string
 import os
 import json
 
@@ -9,310 +9,764 @@ from firebase_admin import credentials, messaging
 app = Flask(__name__)
 
 
-# ============================================================
-# FIREBASE ADMIN
-# ============================================================
+# =========================================================
+# FIREBASE ADMIN SETUP
+# =========================================================
 
 firebase_ready = False
 
 try:
-    service_account = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+    service_account_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
 
-    if service_account:
-        firebase_credential = credentials.Certificate(
-            json.loads(service_account)
-        )
+    if service_account_json:
+        service_account = json.loads(service_account_json)
+        cred = credentials.Certificate(service_account)
 
         if not firebase_admin._apps:
-            firebase_admin.initialize_app(firebase_credential)
+            firebase_admin.initialize_app(cred)
 
         firebase_ready = True
-        print("Firebase initialized successfully.")
+        print("Firebase Admin connected.")
 
     else:
-        print("WARNING: FIREBASE_SERVICE_ACCOUNT is missing.")
+        print("FIREBASE_SERVICE_ACCOUNT is not set.")
 
-except Exception as error:
-    print("Firebase initialization error:", error)
+except Exception as e:
+    print("Firebase setup error:", e)
 
 
-# ============================================================
-# OWNER
-# ============================================================
+# =========================================================
+# DATA
+# =========================================================
 
 owner = {
     "name": "",
     "phone": "",
     "email": "",
     "location": "",
-    "device_id": "",
-    "fcm_token": ""
+    "device_id": ""
 }
 
+# Store multiple devices instead of only one FCM token.
+fcm_tokens = set()
 
-# ============================================================
-# FIRE STATUS
-# ============================================================
 
 fire_status = {
     "fire": False,
-    "flame": "SAFE",
+    "flame": "NOT DETECTED",
     "temperature": 0,
-    "extinguisher": "OFF",
+    "extinguisher": "READY",
     "notification_sent": False
 }
 
 
-# ============================================================
-# SEND FIREBASE NOTIFICATION
-# ============================================================
+# =========================================================
+# SEND NOTIFICATION TO ONE DEVICE
+# =========================================================
 
 def send_notification(token):
-
     if not firebase_ready:
         print("Firebase is not ready.")
         return False
 
-    if not token:
-        print("FCM token is missing.")
-        return False
-
     try:
-
         message = messaging.Message(
             notification=messaging.Notification(
-                title="🚨 SMART FIRE GUARD",
-                body=(
-                    "🔥 FIRE DETECTED! "
-                    "Please check the location immediately."
-                )
+                title="🔥 FIRE ALERT!",
+                body="Smart Fire Guard detected a possible fire."
             ),
             data={
                 "type": "fire_alert",
-                "temperature": str(
-                    fire_status["temperature"]
-                ),
-                "location": owner["location"]
+                "message": "Fire detected by Smart Fire Guard."
             },
             token=token
         )
 
-        response = messaging.send(message)
+        messaging.send(message)
 
-        print("FCM notification sent:", response)
-
+        print("Notification sent to device.")
         return True
 
-    except Exception as error:
+    except Exception as e:
+        print("Notification error:", e)
 
-        print("FCM notification error:", error)
+        # Remove bad/expired token.
+        fcm_tokens.discard(token)
 
         return False
 
 
-# ============================================================
+# =========================================================
+# SEND TO ALL REGISTERED DEVICES
+# =========================================================
+
+def send_to_all_devices():
+    if not fcm_tokens:
+        print("No FCM devices registered.")
+        return False
+
+    success = False
+
+    for token in list(fcm_tokens):
+        if send_notification(token):
+            success = True
+
+    return success
+
+
+# =========================================================
 # FIREBASE SERVICE WORKER
-# ============================================================
+# =========================================================
 
 @app.route("/firebase-messaging-sw.js")
-def firebase_messaging_sw():
+def firebase_service_worker():
 
-    javascript = """
+    firebase_config = {
+        "apiKey": "AIzaSyD1JM4e0Ztg3FUhCkA4tYh8UzEOYcdn9k",
+        "authDomain": "smart-fire-project.firebaseapp.com",
+        "projectId": "smart-fire-project",
+        "storageBucket": "smart-fire-project.firebasestorage.app",
+        "messagingSenderId": "591246962485",
+        "appId": "1:591246962485:web:2030ebe6c34a81f5bd667c"
+    }
+
+    js = f"""
 importScripts(
-    "https://www.gstatic.com/firebasejs/12.19.0/firebase-app-compat.js"
+    "https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"
 );
 
 importScripts(
-    "https://www.gstatic.com/firebasejs/12.19.0/firebase-messaging-compat.js"
+    "https://www.gstatic.com/firebasejs/10.13.2/firebase-messaging-compat.js"
 );
 
-firebase.initializeApp({
-    apiKey: "YOUR_FIREBASE_API_KEY",
-    authDomain: "smart-fire-project.firebaseapp.com",
-    projectId: "smart-fire-project",
-    storageBucket: "smart-fire-project.firebasestorage.app",
-    messagingSenderId: "591246962485",
-    appId: "1:591246962485:web:2030ebe6c34a81f5bd667c"
-});
+firebase.initializeApp({json.dumps(firebase_config)});
 
 const messaging = firebase.messaging();
 
-messaging.onBackgroundMessage(function(payload) {
+messaging.onBackgroundMessage(function(payload) {{
 
-    console.log("Background notification:", payload);
+    console.log("Background message:", payload);
 
     const title =
-        payload.notification?.title ||
-        "🚨 SMART FIRE GUARD";
+        payload.notification?.title || "🔥 FIRE ALERT!";
 
-    const options = {
+    const options = {{
         body:
             payload.notification?.body ||
-            "🔥 Fire detected. Please check immediately.",
-        data: payload.data || {}
-    };
+            "Smart Fire Guard detected a possible fire.",
+        icon: "/favicon.ico",
+        tag: "smart-fire-alert"
+    }};
 
-    self.registration.showNotification(
-        title,
-        options
+    self.registration.showNotification(title, options);
+}});
+
+self.addEventListener("notificationclick", function(event) {{
+    event.notification.close();
+
+    event.waitUntil(
+        clients.matchAll({{
+            type: "window",
+            includeUncontrolled: true
+        }}).then(function(clientList) {{
+
+            for (const client of clientList) {{
+                if ("focus" in client) {{
+                    return client.focus();
+                }}
+            }}
+
+            if (clients.openWindow) {{
+                return clients.openWindow("/");
+            }}
+        }})
     );
-});
+}});
 """
 
-    return javascript, 200, {
+    return js, 200, {
         "Content-Type": "application/javascript"
     }
 
 
-# ============================================================
-# HTML
-# ============================================================
+# =========================================================
+# MAIN WEBSITE
+# =========================================================
 
-HTML = """
+@app.route("/")
+def home():
+
+    return render_template_string("""
 <!DOCTYPE html>
-
-<html>
+<html lang="en">
 
 <head>
 
-<title>Smart Fire Guard</title>
+<meta charset="UTF-8">
 
-<meta
-    name="viewport"
-    content="width=device-width, initial-scale=1"
->
+<meta name="viewport"
+      content="width=device-width, initial-scale=1.0">
+
+<title>Smart Fire Guard</title>
 
 <style>
 
 * {
     box-sizing: border-box;
+    margin: 0;
+    padding: 0;
 }
 
 body {
-    margin: 0;
-    font-family: Arial, sans-serif;
-    background: #f4f8ff;
-    color: #172033;
+    font-family:
+        Inter,
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+
+    min-height: 100vh;
+
+    background:
+        radial-gradient(
+            circle at top left,
+            #26345c,
+            transparent 35%
+        ),
+        radial-gradient(
+            circle at bottom right,
+            #3a1820,
+            transparent 35%
+        ),
+        #080b14;
+
+    color: #ffffff;
 }
+
+
+/* =====================================================
+   HEADER
+   ===================================================== */
 
 header {
-    background: white;
-    border-bottom: 4px solid #1677ff;
-    padding: 20px;
-    text-align: center;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+
+    padding: 18px 7%;
+
+    background: rgba(10, 14, 25, 0.75);
+
+    backdrop-filter: blur(18px);
+
+    border-bottom: 1px solid rgba(255,255,255,0.08);
 }
 
-header h1 {
-    margin: 0;
-    color: #1677ff;
+.logo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+
+    font-size: 20px;
+    font-weight: 800;
+    letter-spacing: 0.5px;
 }
 
-header p {
-    margin: 7px 0 0;
-    color: #555;
+.logo-icon {
+    width: 42px;
+    height: 42px;
+
+    display: flex;
+    justify-content: center;
+    align-items: center;
+
+    border-radius: 13px;
+
+    background:
+        linear-gradient(
+            135deg,
+            #ff6b35,
+            #ff304f
+        );
+
+    box-shadow:
+        0 8px 25px rgba(255, 70, 60, 0.3);
 }
+
+.online {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+
+    color: #8df7b1;
+    font-size: 13px;
+}
+
+.online-dot {
+    width: 9px;
+    height: 9px;
+
+    border-radius: 50%;
+
+    background: #4ade80;
+
+    box-shadow:
+        0 0 12px #4ade80;
+}
+
+
+/* =====================================================
+   PAGE
+   ===================================================== */
 
 .container {
-    max-width: 1000px;
-    margin: auto;
-    padding: 20px;
+    width: 86%;
+    max-width: 1200px;
+
+    margin: 45px auto;
 }
+
+.hero {
+    margin-bottom: 30px;
+}
+
+.hero h1 {
+    font-size: clamp(32px, 5vw, 54px);
+
+    line-height: 1.05;
+
+    margin-bottom: 14px;
+
+    background:
+        linear-gradient(
+            90deg,
+            #ffffff,
+            #ff9b75
+        );
+
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.hero p {
+    color: #aeb7ca;
+    font-size: 16px;
+}
+
+
+/* =====================================================
+   GLASS CARD
+   ===================================================== */
 
 .card {
-    background: white;
-    border: 2px solid #1677ff;
-    border-radius: 15px;
-    padding: 20px;
-    margin-bottom: 20px;
-    box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+    background:
+        linear-gradient(
+            145deg,
+            rgba(255,255,255,0.09),
+            rgba(255,255,255,0.035)
+        );
+
+    border: 1px solid rgba(255,255,255,0.09);
+
+    border-radius: 24px;
+
+    padding: 25px;
+
+    backdrop-filter: blur(20px);
+
+    box-shadow:
+        0 20px 60px rgba(0,0,0,0.25);
 }
 
-h2 {
-    color: #1677ff;
+
+/* =====================================================
+   REGISTRATION
+   ===================================================== */
+
+#registerPage {
+    max-width: 600px;
+    margin: 50px auto;
+}
+
+.section-title {
+    font-size: 25px;
+    margin-bottom: 8px;
+}
+
+.section-subtitle {
+    color: #9ca8bc;
+    margin-bottom: 25px;
+}
+
+.input-group {
+    margin-bottom: 17px;
+}
+
+label {
+    display: block;
+
+    margin-bottom: 7px;
+
+    color: #c5cede;
+
+    font-size: 13px;
 }
 
 input {
     width: 100%;
-    padding: 13px;
-    margin: 7px 0 12px;
-    border: 1px solid #bbb;
-    border-radius: 8px;
-    font-size: 16px;
+
+    padding: 14px 16px;
+
+    border-radius: 13px;
+
+    border: 1px solid rgba(255,255,255,0.1);
+
+    background: rgba(0,0,0,0.25);
+
+    color: white;
+
+    outline: none;
+
+    font-size: 15px;
 }
 
+input:focus {
+    border-color: #ff684b;
+
+    box-shadow:
+        0 0 0 3px rgba(255,104,75,0.12);
+}
+
+
+/* =====================================================
+   BUTTONS
+   ===================================================== */
+
 button {
-    padding: 12px 18px;
     border: none;
-    border-radius: 8px;
-    background: #1677ff;
-    color: white;
-    font-size: 16px;
+
     cursor: pointer;
-    margin: 5px;
+
+    border-radius: 13px;
+
+    padding: 13px 18px;
+
+    font-size: 14px;
+
+    font-weight: 700;
+
+    transition: 0.2s;
 }
 
 button:hover {
-    opacity: 0.85;
+    transform: translateY(-2px);
+}
+
+.primary {
+    width: 100%;
+
+    color: white;
+
+    background:
+        linear-gradient(
+            135deg,
+            #ff6b35,
+            #ff3d58
+        );
+
+    box-shadow:
+        0 10px 25px rgba(255,70,60,0.25);
+}
+
+.secondary {
+    color: white;
+
+    background: rgba(255,255,255,0.08);
+
+    border: 1px solid rgba(255,255,255,0.1);
 }
 
 .danger {
-    background: #e53935;
+    color: white;
+
+    background:
+        linear-gradient(
+            135deg,
+            #ef4444,
+            #b91c1c
+        );
+}
+
+
+/* =====================================================
+   DASHBOARD
+   ===================================================== */
+
+#dashboardPage {
+    display: none;
+}
+
+.dashboard-grid {
+    display: grid;
+
+    grid-template-columns:
+        repeat(4, 1fr);
+
+    gap: 17px;
+
+    margin-bottom: 20px;
+}
+
+.status-card {
+    min-height: 145px;
+}
+
+.status-label {
+    color: #9da8bb;
+
+    font-size: 13px;
+
+    margin-bottom: 14px;
+}
+
+.status-value {
+    font-size: 25px;
+
+    font-weight: 800;
+}
+
+.status-icon {
+    font-size: 27px;
+
+    margin-bottom: 12px;
 }
 
 .safe {
-    background: #20a050;
+    color: #70e39a;
 }
 
-.notification {
-    background: #673ab7;
+.warning {
+    color: #ffb15e;
 }
 
-.status {
-    padding: 20px;
-    border-radius: 12px;
-    text-align: center;
-    font-size: 22px;
-    font-weight: bold;
-    background: #e8fff0;
-    color: #16833c;
+.danger-text {
+    color: #ff6868;
 }
 
-.fire {
-    background: #ffe5e5;
-    color: #d00000;
-}
 
-.grid {
+/* =====================================================
+   MAIN GRID
+   ===================================================== */
+
+.main-grid {
     display: grid;
+
     grid-template-columns:
-        repeat(auto-fit, minmax(200px, 1fr));
-    gap: 15px;
+        1.4fr 0.8fr;
+
+    gap: 20px;
 }
 
-.box {
-    background: #f7f9fc;
-    padding: 15px;
-    border-radius: 10px;
-    border: 1px solid #ddd;
+.fire-panel {
+    min-height: 310px;
+
+    display: flex;
+
+    flex-direction: column;
+
+    justify-content: space-between;
 }
 
-.value {
-    font-size: 25px;
-    font-weight: bold;
-    margin-top: 5px;
+.fire-circle {
+    width: 125px;
+    height: 125px;
+
+    margin: 15px auto 20px;
+
+    display: flex;
+
+    justify-content: center;
+    align-items: center;
+
+    border-radius: 50%;
+
+    font-size: 48px;
+
+    background:
+        rgba(75, 220, 120, 0.08);
+
+    border:
+        1px solid rgba(75, 220, 120, 0.2);
+
+    box-shadow:
+        0 0 50px rgba(75,220,120,0.08);
 }
+
+.fire-circle.alert {
+    background:
+        rgba(255,60,60,0.12);
+
+    border-color:
+        rgba(255,70,70,0.35);
+
+    box-shadow:
+        0 0 60px rgba(255,50,50,0.15);
+}
+
+.fire-title {
+    text-align: center;
+
+    font-size: 22px;
+
+    font-weight: 800;
+}
+
+.fire-description {
+    text-align: center;
+
+    color: #9da8bb;
+
+    margin-top: 7px;
+}
+
+
+/* =====================================================
+   OWNER CARD
+   ===================================================== */
+
+.owner-row {
+    display: flex;
+
+    justify-content: space-between;
+
+    gap: 20px;
+
+    padding: 13px 0;
+
+    border-bottom:
+        1px solid rgba(255,255,255,0.07);
+}
+
+.owner-row:last-child {
+    border-bottom: none;
+}
+
+.owner-key {
+    color: #8f9aae;
+}
+
+.owner-value {
+    text-align: right;
+
+    max-width: 60%;
+
+    word-break: break-word;
+}
+
+
+/* =====================================================
+   ACTIONS
+   ===================================================== */
+
+.actions {
+    display: grid;
+
+    grid-template-columns:
+        repeat(3, 1fr);
+
+    gap: 10px;
+
+    margin-top: 20px;
+}
+
+.actions button {
+    width: 100%;
+}
+
+
+/* =====================================================
+   NOTIFICATION
+   ===================================================== */
 
 .notification-box {
-    padding: 12px;
-    margin-top: 10px;
-    border-radius: 8px;
-    background: #f2f2f2;
+    margin-top: 20px;
+
+    padding: 15px;
+
+    border-radius: 15px;
+
+    background:
+        rgba(255,255,255,0.05);
+
+    color: #b8c2d3;
+
+    font-size: 14px;
 }
+
+.notification-box strong {
+    color: white;
+}
+
+
+/* =====================================================
+   FOOTER
+   ===================================================== */
 
 footer {
     text-align: center;
-    padding: 20px;
-    color: #666;
+
+    color: #667085;
+
+    font-size: 12px;
+
+    margin-top: 35px;
+}
+
+
+/* =====================================================
+   MOBILE
+   ===================================================== */
+
+@media (max-width: 850px) {
+
+    .dashboard-grid {
+        grid-template-columns:
+            repeat(2, 1fr);
+    }
+
+    .main-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+
+@media (max-width: 550px) {
+
+    header {
+        padding: 15px 5%;
+    }
+
+    .container {
+        width: 92%;
+        margin: 30px auto;
+    }
+
+    .dashboard-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .actions {
+        grid-template-columns: 1fr;
+    }
+
+    .logo span {
+        display: none;
+    }
 }
 
 </style>
@@ -325,238 +779,415 @@ footer {
 
 <header>
 
-<h1>🔥 SMART FIRE GUARD</h1>
+    <div class="logo">
 
-<p>
-Automatic Fire Detection & Alert System
-</p>
+        <div class="logo-icon">
+            🔥
+        </div>
+
+        <span>SMART FIRE GUARD</span>
+
+    </div>
+
+    <div class="online">
+
+        <div class="online-dot"></div>
+
+        System Online
+
+    </div>
 
 </header>
 
 
-<div class="container">
+<main class="container">
 
 
-<!-- OWNER -->
+<!-- =====================================================
+     REGISTRATION PAGE
+===================================================== -->
 
-<div class="card">
+<section id="registerPage" class="card">
 
-<h2>👤 Owner Registration</h2>
+    <h2 class="section-title">
+        Welcome to Smart Fire Guard
+    </h2>
 
-<input
-    id="name"
-    placeholder="Owner Name"
->
+    <p class="section-subtitle">
+        Register the owner once to configure your fire alert system.
+    </p>
 
-<input
-    id="phone"
-    placeholder="Phone Number (+91...)"
->
 
-<input
-    id="email"
-    placeholder="Email Address"
->
+    <div class="input-group">
 
-<input
-    id="location"
-    placeholder="Fire Guard Location"
->
+        <label>Owner Name</label>
 
-<input
-    id="device"
-    placeholder="Device ID"
->
+        <input
+            id="name"
+            type="text"
+            placeholder="Enter owner name"
+        >
 
-<button onclick="registerOwner()">
-Register Owner
-</button>
+    </div>
 
-<p id="registerMessage"></p>
 
-</div>
+    <div class="input-group">
 
+        <label>Phone Number</label>
 
-<!-- NOTIFICATIONS -->
+        <input
+            id="phone"
+            type="tel"
+            placeholder="Enter phone number"
+        >
 
-<div class="card">
+    </div>
 
-<h2>🔔 Firebase Notifications</h2>
 
-<p>
-Enable notifications on this device so Smart Fire Guard
-can send fire alerts.
-</p>
+    <div class="input-group">
 
-<button
-    class="notification"
-    onclick="enableNotifications()"
->
-🔔 Enable Notifications
-</button>
+        <label>Email</label>
 
-<div
-    id="notificationMessage"
-    class="notification-box"
->
-Notifications are not enabled.
-</div>
+        <input
+            id="email"
+            type="email"
+            placeholder="Enter email"
+        >
 
-</div>
+    </div>
 
 
-<!-- STATUS -->
+    <div class="input-group">
 
-<div class="card">
+        <label>House / Location</label>
 
-<h2>🚨 System Status</h2>
+        <input
+            id="location"
+            type="text"
+            placeholder="Enter house location"
+        >
 
-<div
-    id="status"
-    class="status"
->
-✅ SYSTEM IS SAFE
-</div>
+    </div>
 
-</div>
 
+    <button
+        class="primary"
+        onclick="registerOwner()"
+    >
+        Register & Continue
+    </button>
 
-<!-- SENSOR -->
+</section>
 
-<div class="card">
 
-<h2>📊 Sensor Information</h2>
+<!-- =====================================================
+     DASHBOARD
+===================================================== -->
 
-<div class="grid">
+<section id="dashboardPage">
 
 
-<div class="box">
+    <div class="hero">
 
-Flame
+        <h1>
+            Fire Protection Dashboard
+        </h1>
 
-<div
-    id="flame"
-    class="value"
->
-SAFE
-</div>
+        <p>
+            Monitor your Smart Fire Guard system in real time.
+        </p>
 
-</div>
+    </div>
 
 
-<div class="box">
+    <!-- STATUS CARDS -->
 
-Temperature
+    <div class="dashboard-grid">
 
-<div
-    id="temperature"
-    class="value"
->
-0 °C
-</div>
 
-</div>
+        <div class="card status-card">
 
+            <div class="status-icon">
+                🔥
+            </div>
 
-<div class="box">
+            <div class="status-label">
+                FIRE STATUS
+            </div>
 
-Extinguisher
+            <div
+                id="fireStatus"
+                class="status-value safe"
+            >
+                SAFE
+            </div>
 
-<div
-    id="extinguisher"
-    class="value"
->
-OFF
-</div>
+        </div>
 
-</div>
 
+        <div class="card status-card">
 
-<div class="box">
+            <div class="status-icon">
+                🌡️
+            </div>
 
-Notification
+            <div class="status-label">
+                TEMPERATURE
+            </div>
 
-<div
-    id="notification"
-    class="value"
->
-NOT SENT
-</div>
+            <div
+                id="temperature"
+                class="status-value"
+            >
+                0 °C
+            </div>
 
-</div>
+        </div>
 
 
-</div>
+        <div class="card status-card">
 
-</div>
+            <div class="status-icon">
+                👁️
+            </div>
 
+            <div class="status-label">
+                FLAME SENSOR
+            </div>
 
-<!-- DEMO -->
+            <div
+                id="flameStatus"
+                class="status-value safe"
+            >
+                NOT DETECTED
+            </div>
 
-<div class="card">
+        </div>
 
-<h2>🧪 Demonstration</h2>
 
-<p>
-Use these buttons to test the website.
-Do not use real fire for testing.
-</p>
+        <div class="card status-card">
 
-<button
-    class="danger"
-    onclick="testFire()"
->
-🔥 Test Fire
-</button>
+            <div class="status-icon">
+                💧
+            </div>
 
-<button
-    class="safe"
-    onclick="resetSystem()"
->
-✅ Reset System
-</button>
+            <div class="status-label">
+                EXTINGUISHER
+            </div>
 
-<p id="message"></p>
+            <div
+                id="extinguisher"
+                class="status-value safe"
+            >
+                READY
+            </div>
 
-</div>
+        </div>
 
+    </div>
 
-</div>
+
+    <!-- MAIN -->
+
+    <div class="main-grid">
+
+
+        <!-- FIRE PANEL -->
+
+        <div class="card fire-panel">
+
+            <div>
+
+                <div
+                    id="fireCircle"
+                    class="fire-circle"
+                >
+                    🛡️
+                </div>
+
+                <div
+                    id="fireTitle"
+                    class="fire-title"
+                >
+                    System Protected
+                </div>
+
+                <div
+                    id="fireDescription"
+                    class="fire-description"
+                >
+                    No fire has been detected.
+                </div>
+
+            </div>
+
+
+            <div class="notification-box">
+
+                🔔
+
+                <strong>
+                    Notifications:
+                </strong>
+
+                <span id="notificationStatus">
+                    Not enabled
+                </span>
+
+            </div>
+
+
+            <div class="actions">
+
+                <button
+                    class="primary"
+                    onclick="enableNotifications()"
+                >
+                    🔔 Enable Notifications
+                </button>
+
+                <button
+                    class="danger"
+                    onclick="testFire()"
+                >
+                    🚨 Test Fire
+                </button>
+
+                <button
+                    class="secondary"
+                    onclick="resetSystem()"
+                >
+                    ↻ Reset
+                </button>
+
+            </div>
+
+        </div>
+
+
+        <!-- OWNER -->
+
+        <div class="card">
+
+            <h2 class="section-title">
+                👤 Owner
+            </h2>
+
+            <p class="section-subtitle">
+                Registered information
+            </p>
+
+
+            <div class="owner-row">
+
+                <span class="owner-key">
+                    Name
+                </span>
+
+                <span
+                    id="ownerName"
+                    class="owner-value"
+                >
+                    -
+                </span>
+
+            </div>
+
+
+            <div class="owner-row">
+
+                <span class="owner-key">
+                    Phone
+                </span>
+
+                <span
+                    id="ownerPhone"
+                    class="owner-value"
+                >
+                    -
+                </span>
+
+            </div>
+
+
+            <div class="owner-row">
+
+                <span class="owner-key">
+                    Email
+                </span>
+
+                <span
+                    id="ownerEmail"
+                    class="owner-value"
+                >
+                    -
+                </span>
+
+            </div>
+
+
+            <div class="owner-row">
+
+                <span class="owner-key">
+                    Location
+                </span>
+
+                <span
+                    id="ownerLocation"
+                    class="owner-value"
+                >
+                    -
+                </span>
+
+            </div>
+
+
+            <button
+                class="secondary"
+                style="width:100%; margin-top:20px;"
+                onclick="changeOwner()"
+            >
+                ⚙️ Change Owner Details
+            </button>
+
+        </div>
+
+    </div>
+
+
+</section>
 
 
 <footer>
 
-Smart Fire Guard © 2026
+    Smart Fire Guard • School Competition Project
 
 </footer>
 
 
-<script type="module">
-
-import {
-    initializeApp
-}
-from
-"https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
+</main>
 
 
-import {
-    getMessaging,
-    getToken,
-    onMessage
-}
-from
-"https://www.gstatic.com/firebasejs/12.19.0/firebase-messaging.js";
+<!-- =====================================================
+     FIREBASE
+===================================================== -->
+
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
+
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-messaging-compat.js"></script>
 
 
-// ==========================================================
-// FIREBASE WEB CONFIG
-// ==========================================================
+<script>
+
+
+// =========================================================
+// FIREBASE CONFIG
+// =========================================================
 
 const firebaseConfig = {
 
     apiKey:
-        "AIzaSyD1JM4e0Ztg3FUhCkA4t9Yh8UzEOYcdn9k",
+        "AIzaSyD1JM4e0Ztg3FUhCkA4tYh8UzEOYcdn9k",
 
     authDomain:
         "smart-fire-project.firebaseapp.com",
@@ -572,45 +1203,333 @@ const firebaseConfig = {
 
     appId:
         "1:591246962485:web:2030ebe6c34a81f5bd667c"
-
 };
 
 
-const firebaseApp =
-    initializeApp(firebaseConfig);
+firebase.initializeApp(firebaseConfig);
+
+const messaging = firebase.messaging();
 
 
-const messaging =
-    getMessaging(firebaseApp);
+let currentFcmToken =
+    localStorage.getItem("smartFireFcmToken") || "";
 
 
-// ==========================================================
-// ENABLE NOTIFICATIONS
-// ==========================================================
+// =========================================================
+// YOUR FCM VAPID KEY
+// =========================================================
+//
+// Keep your existing Firebase Web Push certificate key here.
+// Do NOT put your Firebase Admin private key here.
+//
 
-window.enableNotifications = async function() {
+const vapidKey = "YOUR_EXISTING_FIREBASE_VAPID_KEY";
 
-    const messageBox =
-        document.getElementById(
-            "notificationMessage"
+
+// =========================================================
+// LOAD SAVED OWNER
+// =========================================================
+
+window.addEventListener("load", async function() {
+
+    const savedOwner =
+        localStorage.getItem("smartFireOwner");
+
+    if (savedOwner) {
+
+        try {
+
+            const data =
+                JSON.parse(savedOwner);
+
+            showDashboard(data);
+
+            // Re-register owner with server.
+            await fetch("/register", {
+
+                method: "POST",
+
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body: JSON.stringify(data)
+
+            });
+
+        }
+
+        catch (error) {
+
+            console.log(
+                "Saved owner data error:",
+                error
+            );
+
+            localStorage.removeItem(
+                "smartFireOwner"
+            );
+
+            showRegistration();
+        }
+
+    }
+
+    else {
+
+        showRegistration();
+
+    }
+
+
+    // If notification permission was already granted,
+    // automatically refresh the FCM token.
+
+    if (
+        "Notification" in window &&
+        Notification.permission === "granted"
+    ) {
+
+        enableNotifications();
+
+    }
+
+
+    // Start live status updates.
+
+    updateStatus();
+
+    setInterval(updateStatus, 3000);
+
+});
+
+
+// =========================================================
+// REGISTRATION
+// =========================================================
+
+async function registerOwner() {
+
+    const data = {
+
+        name:
+            document.getElementById("name").value.trim(),
+
+        phone:
+            document.getElementById("phone").value.trim(),
+
+        email:
+            document.getElementById("email").value.trim(),
+
+        location:
+            document.getElementById("location").value.trim(),
+
+        device_id:
+            getDeviceId()
+
+    };
+
+
+    if (!data.name || !data.phone) {
+
+        alert(
+            "Please enter owner name and phone number."
         );
+
+        return;
+    }
+
 
     try {
 
-        if (!("Notification" in window)) {
+        const response =
+            await fetch("/register", {
 
-            messageBox.innerText =
-                "❌ This browser does not support notifications.";
+                method: "POST",
 
-            return;
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body:
+                    JSON.stringify(data)
+
+            });
+
+
+        if (!response.ok) {
+
+            throw new Error(
+                "Registration failed."
+            );
         }
 
 
-        const registration =
-            await navigator.serviceWorker.register(
-                "/firebase-messaging-sw.js"
-            );
+        // Save owner in this browser/device.
 
+        localStorage.setItem(
+            "smartFireOwner",
+            JSON.stringify(data)
+        );
+
+
+        showDashboard(data);
+
+
+        // Ask for notification permission.
+
+        await enableNotifications();
+
+    }
+
+    catch (error) {
+
+        console.error(error);
+
+        alert(
+            "Registration could not be completed."
+        );
+
+    }
+
+}
+
+
+// =========================================================
+// DEVICE ID
+// =========================================================
+
+function getDeviceId() {
+
+    let id =
+        localStorage.getItem(
+            "smartFireDeviceId"
+        );
+
+
+    if (!id) {
+
+        id =
+            "device-" +
+            Date.now() +
+            "-" +
+            Math.random()
+                .toString(36)
+                .substring(2, 10);
+
+        localStorage.setItem(
+            "smartFireDeviceId",
+            id
+        );
+    }
+
+
+    return id;
+}
+
+
+// =========================================================
+// SHOW DASHBOARD
+// =========================================================
+
+function showDashboard(data) {
+
+    document.getElementById(
+        "registerPage"
+    ).style.display = "none";
+
+
+    document.getElementById(
+        "dashboardPage"
+    ).style.display = "block";
+
+
+    document.getElementById(
+        "ownerName"
+    ).textContent =
+        data.name || "-";
+
+
+    document.getElementById(
+        "ownerPhone"
+    ).textContent =
+        data.phone || "-";
+
+
+    document.getElementById(
+        "ownerEmail"
+    ).textContent =
+        data.email || "-";
+
+
+    document.getElementById(
+        "ownerLocation"
+    ).textContent =
+        data.location || "-";
+
+}
+
+
+// =========================================================
+// SHOW REGISTRATION
+// =========================================================
+
+function showRegistration() {
+
+    document.getElementById(
+        "registerPage"
+    ).style.display = "block";
+
+
+    document.getElementById(
+        "dashboardPage"
+    ).style.display = "none";
+
+}
+
+
+// =========================================================
+// CHANGE OWNER
+// =========================================================
+
+function changeOwner() {
+
+    if (
+        confirm(
+            "Do you want to change the registered owner?"
+        )
+    ) {
+
+        localStorage.removeItem(
+            "smartFireOwner"
+        );
+
+        showRegistration();
+
+    }
+
+}
+
+
+// =========================================================
+// ENABLE FCM NOTIFICATIONS
+// =========================================================
+
+async function enableNotifications() {
+
+    if (!("Notification" in window)) {
+
+        alert(
+            "This browser does not support notifications."
+        );
+
+        return null;
+    }
+
+
+    try {
 
         const permission =
             await Notification.requestPermission();
@@ -618,39 +1537,202 @@ window.enableNotifications = async function() {
 
         if (permission !== "granted") {
 
-            messageBox.innerText =
-                "❌ Notification permission was not granted.";
+            document.getElementById(
+                "notificationStatus"
+            ).textContent =
+                "Permission not granted.";
 
-            return;
+            return null;
         }
 
 
-        const token =
-            await getToken(
-                messaging,
-                {
-                    vapidKey:
-                        "BDMQ6bqrix1EQOm7fOuz-PBd_jHarjFNl3WrQtmFYVg72scD_rwzvLleIwVw0jJ9JXAxrlb0ygUSquZBWYBLm4I",
+        // Register Firebase service worker.
 
-                    serviceWorkerRegistration:
-                        registration
-                }
+        const registration =
+            await navigator.serviceWorker.register(
+                "/firebase-messaging-sw.js"
             );
+
+
+        // Get this browser's unique FCM token.
+
+        const token =
+            await messaging.getToken({
+
+                vapidKey: vapidKey,
+
+                serviceWorkerRegistration:
+                    registration
+
+            });
 
 
         if (!token) {
 
-            messageBox.innerText =
-                "❌ Firebase notification token was not created.";
-
-            return;
+            throw new Error(
+                "FCM token was not created."
+            );
         }
 
 
+        currentFcmToken = token;
+
+
+        localStorage.setItem(
+            "smartFireFcmToken",
+            token
+        );
+
+
+        // Send token to Flask server.
+
+        await fetch(
+            "/save-fcm-token",
+            {
+
+                method: "POST",
+
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body: JSON.stringify({
+                    token: token
+                })
+
+            }
+        );
+
+
+        document.getElementById(
+            "notificationStatus"
+        ).textContent =
+            "Enabled on this device";
+
+
+        return token;
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "FCM error:",
+            error
+        );
+
+
+        document.getElementById(
+            "notificationStatus"
+        ).textContent =
+            "Could not enable notifications.";
+
+
+        return null;
+
+    }
+
+}
+
+
+// =========================================================
+// FOREGROUND FCM MESSAGE
+// =========================================================
+
+messaging.onMessage(function(payload) {
+
+    console.log(
+        "Foreground notification:",
+        payload
+    );
+
+
+    const title =
+        payload.notification?.title ||
+        "🔥 FIRE ALERT!";
+
+
+    const body =
+        payload.notification?.body ||
+        "Smart Fire Guard detected a possible fire.";
+
+
+    if (
+        "Notification" in window &&
+        Notification.permission === "granted"
+    ) {
+
+        new Notification(
+            title,
+            {
+                body: body
+            }
+        );
+
+    }
+
+
+    updateStatus();
+
+});
+
+
+// =========================================================
+// TEST FIRE
+// =========================================================
+
+async function testFire() {
+
+    // Make sure this device has a current FCM token.
+
+    let token = currentFcmToken;
+
+
+    if (
+        "Notification" in window &&
+        Notification.permission === "granted"
+    ) {
+
+        try {
+
+            const refreshedToken =
+                await enableNotifications();
+
+            if (refreshedToken) {
+
+                token = refreshedToken;
+
+            }
+
+        }
+
+        catch (error) {
+
+            console.log(error);
+
+        }
+
+    }
+
+
+    if (!token) {
+
+        alert(
+            "First press 'Enable Notifications' and allow notifications."
+        );
+
+        return;
+    }
+
+
+    try {
+
         const response =
             await fetch(
-                "/save-fcm-token",
+                "/api/test-fire",
                 {
+
                     method: "POST",
 
                     headers: {
@@ -661,6 +1743,7 @@ window.enableNotifications = async function() {
                     body: JSON.stringify({
                         token: token
                     })
+
                 }
             );
 
@@ -669,228 +1752,70 @@ window.enableNotifications = async function() {
             await response.json();
 
 
-        if (result.success) {
+        if (!response.ok) {
 
-            messageBox.innerText =
-                "✅ Notifications enabled successfully!";
+            alert(
+                result.message ||
+                "Test failed."
+            );
 
-        } else {
-
-            messageBox.innerText =
-                "❌ " + result.message;
-
+            return;
         }
 
 
-    } catch (error) {
-
-        console.error(
-            "Notification error:",
-            error
+        alert(
+            "🔥 Test Fire sent to this device."
         );
-
-        messageBox.innerText =
-            "❌ Notification setup failed: "
-            + error.message;
-
-    }
-
-};
-
-
-// ==========================================================
-// FOREGROUND NOTIFICATION
-// ==========================================================
-
-onMessage(
-    messaging,
-    function(payload) {
-
-        console.log(
-            "Firebase foreground message:",
-            payload
-        );
-
-
-        const title =
-            payload.notification?.title ||
-            "🚨 SMART FIRE GUARD";
-
-
-        const body =
-            payload.notification?.body ||
-            "🔥 Fire detected!";
-
-
-        if (
-            Notification.permission ===
-            "granted"
-        ) {
-
-            new Notification(
-                title,
-                {
-                    body: body
-                }
-            );
-
-        }
-
-    }
-);
-
-
-// ==========================================================
-// REGISTER OWNER
-// ==========================================================
-
-window.registerOwner = async function() {
-
-    const data = {
-
-        name:
-            document.getElementById("name").value,
-
-        phone:
-            document.getElementById("phone").value,
-
-        email:
-            document.getElementById("email").value,
-
-        location:
-            document.getElementById("location").value,
-
-        device_id:
-            document.getElementById("device").value
-
-    };
-
-
-    try {
-
-        const response =
-            await fetch(
-                "/register",
-                {
-                    method: "POST",
-
-                    headers: {
-                        "Content-Type":
-                            "application/json"
-                    },
-
-                    body:
-                        JSON.stringify(data)
-                }
-            );
-
-
-        const result =
-            await response.json();
-
-
-        document.getElementById(
-            "registerMessage"
-        ).innerText =
-            result.message;
-
-    } catch (error) {
-
-        document.getElementById(
-            "registerMessage"
-        ).innerText =
-            "Registration failed.";
-
-    }
-
-};
-
-
-// ==========================================================
-// TEST FIRE
-// ==========================================================
-
-window.testFire = async function() {
-
-    try {
-
-        const response =
-            await fetch(
-                "/api/test-fire",
-                {
-                    method: "POST"
-                }
-            );
-
-
-        const result =
-            await response.json();
-
-
-        document.getElementById(
-            "message"
-        ).innerText =
-            result.message;
 
 
         updateStatus();
 
-    } catch (error) {
+    }
 
-        document.getElementById(
-            "message"
-        ).innerText =
-            "Test failed.";
+    catch (error) {
+
+        console.error(error);
+
+        alert(
+            "Could not contact the server."
+        );
 
     }
 
-};
+}
 
 
-// ==========================================================
+// =========================================================
 // RESET
-// ==========================================================
+// =========================================================
 
-window.resetSystem = async function() {
+async function resetSystem() {
 
     try {
 
-        const response =
-            await fetch(
-                "/api/reset",
-                {
-                    method: "POST"
-                }
-            );
-
-
-        const result =
-            await response.json();
-
-
-        document.getElementById(
-            "message"
-        ).innerText =
-            result.message;
-
+        await fetch(
+            "/api/reset",
+            {
+                method: "POST"
+            }
+        );
 
         updateStatus();
 
-    } catch (error) {
+    }
 
-        document.getElementById(
-            "message"
-        ).innerText =
-            "Reset failed.";
+    catch (error) {
+
+        console.error(error);
 
     }
 
-};
+}
 
 
-// ==========================================================
-// UPDATE STATUS
-// ==========================================================
+// =========================================================
+// LIVE STATUS
+// =========================================================
 
 async function updateStatus() {
 
@@ -900,62 +1825,178 @@ async function updateStatus() {
             await fetch("/status");
 
 
+        if (!response.ok) {
+
+            return;
+        }
+
+
         const data =
             await response.json();
 
 
-        const status =
-            document.getElementById("status");
+        const fire =
+            data.fire === true;
 
 
-        if (data.fire === true) {
-
-            status.innerText =
-                "🚨 FIRE DETECTED!";
-
-            status.className =
-                "status fire";
-
-        } else {
-
-            status.innerText =
-                "✅ SYSTEM IS SAFE";
-
-            status.className =
-                "status";
-
-        }
+        const fireStatus =
+            document.getElementById(
+                "fireStatus"
+            );
 
 
-        document.getElementById(
-            "flame"
-        ).innerText =
-            data.flame;
+        const flameStatus =
+            document.getElementById(
+                "flameStatus"
+            );
+
+
+        const extinguisher =
+            document.getElementById(
+                "extinguisher"
+            );
+
+
+        const fireCircle =
+            document.getElementById(
+                "fireCircle"
+            );
+
+
+        const fireTitle =
+            document.getElementById(
+                "fireTitle"
+            );
+
+
+        const fireDescription =
+            document.getElementById(
+                "fireDescription"
+            );
 
 
         document.getElementById(
             "temperature"
-        ).innerText =
-            data.temperature + " °C";
+        ).textContent =
+            (data.temperature ?? 0) +
+            " °C";
 
+
+        // FIRE
+
+        if (fire) {
+
+            fireStatus.textContent =
+                "FIRE DETECTED";
+
+            fireStatus.className =
+                "status-value danger-text";
+
+
+            fireCircle.classList.add(
+                "alert"
+            );
+
+            fireCircle.textContent =
+                "🔥";
+
+
+            fireTitle.textContent =
+                "Fire Alert";
+
+
+            fireDescription.textContent =
+                "The system has detected a possible fire.";
+
+        }
+
+        else {
+
+            fireStatus.textContent =
+                "SAFE";
+
+            fireStatus.className =
+                "status-value safe";
+
+
+            fireCircle.classList.remove(
+                "alert"
+            );
+
+            fireCircle.textContent =
+                "🛡️";
+
+
+            fireTitle.textContent =
+                "System Protected";
+
+
+            fireDescription.textContent =
+                "No fire has been detected.";
+
+        }
+
+
+        // FLAME
+
+        flameStatus.textContent =
+            data.flame || "NOT DETECTED";
+
+
+        if (fire) {
+
+            flameStatus.className =
+                "status-value danger-text";
+
+        }
+
+        else {
+
+            flameStatus.className =
+                "status-value safe";
+
+        }
+
+
+        // EXTINGUISHER
+
+        extinguisher.textContent =
+            data.extinguisher || "READY";
+
+
+        if (data.extinguisher === "ACTIVE") {
+
+            extinguisher.className =
+                "status-value warning";
+
+        }
+
+        else {
+
+            extinguisher.className =
+                "status-value safe";
+
+        }
+
+
+        // NOTIFICATION
 
         document.getElementById(
-            "extinguisher"
-        ).innerText =
-            data.extinguisher;
-
-
-        document.getElementById(
-            "notification"
-        ).innerText =
+            "notificationStatus"
+        ).textContent =
             data.notification_sent
-            ? "SENT"
-            : "NOT SENT";
+                ? "Notification sent"
+                : (
+                    document.getElementById(
+                        "notificationStatus"
+                    ).textContent
+                );
 
+    }
 
-    } catch (error) {
+    catch (error) {
 
-        console.error(
+        console.log(
             "Status update error:",
             error
         );
@@ -964,327 +2005,270 @@ async function updateStatus() {
 
 }
 
-
-setInterval(
-    updateStatus,
-    3000
-);
-
-
-updateStatus();
-
 </script>
-
 
 </body>
 
 </html>
-"""
+""")
 
 
-# ============================================================
-# HOME
-# ============================================================
-
-@app.route("/")
-def home():
-
-    return render_template_string(HTML)
-
-
-# ============================================================
+# =========================================================
 # REGISTER OWNER
-# ============================================================
+# =========================================================
 
 @app.route("/register", methods=["POST"])
 def register():
 
+    global owner
+
     data = request.get_json(silent=True) or {}
+
 
     owner["name"] = data.get(
         "name",
         ""
-    ).strip()
+    )
 
     owner["phone"] = data.get(
         "phone",
         ""
-    ).strip()
+    )
 
     owner["email"] = data.get(
         "email",
         ""
-    ).strip()
+    )
 
     owner["location"] = data.get(
         "location",
         ""
-    ).strip()
+    )
 
     owner["device_id"] = data.get(
         "device_id",
         ""
-    ).strip()
-
-
-    if not owner["name"] or not owner["phone"]:
-
-        return jsonify({
-            "success": False,
-            "message":
-                "Name and phone number are required."
-        }), 400
+    )
 
 
     return jsonify({
         "success": True,
-        "message":
-            "Owner registered successfully!"
+        "message": "Owner registered."
     })
 
 
-# ============================================================
+# =========================================================
 # SAVE FCM TOKEN
-# ============================================================
+# =========================================================
 
 @app.route("/save-fcm-token", methods=["POST"])
 def save_fcm_token():
 
     data = request.get_json(silent=True) or {}
 
-    token = data.get(
-        "token",
-        ""
-    ).strip()
+    token = data.get("token", "").strip()
 
 
     if not token:
 
         return jsonify({
             "success": False,
-            "message":
-                "No Firebase token received."
+            "message": "FCM token missing."
         }), 400
 
 
-    owner["fcm_token"] = token
+    fcm_tokens.add(token)
 
-    print("FCM token saved.")
+
+    print(
+        "Registered FCM devices:",
+        len(fcm_tokens)
+    )
 
 
     return jsonify({
         "success": True,
-        "message":
-            "Notification device registered."
+        "message": "Device notification token saved.",
+        "devices": len(fcm_tokens)
     })
 
 
-# ============================================================
+# =========================================================
 # STATUS
-# ============================================================
+# =========================================================
 
-@app.route("/status", methods=["GET"])
+@app.route("/status")
 def status():
 
-    return jsonify({
-
-        "fire":
-            fire_status["fire"],
-
-        "flame":
-            fire_status["flame"],
-
-        "temperature":
-            fire_status["temperature"],
-
-        "extinguisher":
-            fire_status["extinguisher"],
-
-        "notification_sent":
-            fire_status["notification_sent"],
-
-        "owner":
-            owner["name"]
-
-    })
+    return jsonify(fire_status)
 
 
-# ============================================================
-# ESP8266 FIRE API
-# ============================================================
+# =========================================================
+# REAL ESP8266 FIRE EVENT
+# =========================================================
 
 @app.route("/api/fire", methods=["POST"])
-def fire_api():
+def api_fire():
 
-    data = request.get_json(
-        silent=True
-    ) or {}
+    global fire_status
+
+    data = request.get_json(silent=True) or {}
 
 
-    fire = data.get(
+    fire_value = data.get(
         "fire",
-        False
+        True
     )
 
-    flame = data.get(
+
+    fire_status["fire"] = bool(
+        fire_value
+    )
+
+
+    fire_status["flame"] = data.get(
         "flame",
         "DETECTED"
     )
 
-    temperature = data.get(
+
+    fire_status["temperature"] = data.get(
         "temperature",
-        82
+        0
     )
 
 
-    # --------------------------------------------------------
-    # FIRE DETECTED
-    # --------------------------------------------------------
+    if fire_status["fire"]:
 
-    if fire:
-
-        fire_status["fire"] = True
-
-        fire_status["flame"] = "DETECTED"
-
-        fire_status["temperature"] = temperature
-
-        fire_status["extinguisher"] = "ACTIVATED"
+        fire_status["extinguisher"] = "ACTIVE"
 
 
-        # Send only once until reset
-
-        if (
-            not fire_status["notification_sent"]
-            and owner["fcm_token"]
-        ):
-
-            success = send_notification(
-                owner["fcm_token"]
-            )
-
-            if success:
-
-                fire_status[
-                    "notification_sent"
-                ] = True
+        notification_ok =
+            send_to_all_devices()
 
 
-        return jsonify({
-
-            "success": True,
-
-            "fire": True,
-
-            "message":
-                "Fire detected. "
-                "Extinguisher activated."
-
-        })
+        fire_status[
+            "notification_sent"
+        ] = notification_ok
 
 
-    # --------------------------------------------------------
-    # SAFE
-    # --------------------------------------------------------
+    else:
 
-    fire_status["fire"] = False
-
-    fire_status["flame"] = flame
-
-    fire_status["temperature"] = temperature
-
-    fire_status["extinguisher"] = "OFF"
+        fire_status[
+            "extinguisher"
+        ] = "READY"
 
 
     return jsonify({
-
         "success": True,
-
-        "fire": False,
-
-        "message":
-            "System is safe."
-
+        "fire": fire_status["fire"],
+        "notification_sent":
+            fire_status["notification_sent"]
     })
 
 
-# ============================================================
+# =========================================================
 # TEST FIRE
-# ============================================================
+# =========================================================
 
 @app.route("/api/test-fire", methods=["POST"])
-def test_fire():
+def api_test_fire():
+
+    global fire_status
+
+    data = request.get_json(silent=True) or {}
+
+    test_token = data.get(
+        "token",
+        ""
+    ).strip()
+
 
     fire_status["fire"] = True
 
-    fire_status["flame"] = "DETECTED"
+    fire_status["flame"] = "TEST FIRE"
 
-    fire_status["temperature"] = 82
+    fire_status["temperature"] = 0
 
-    fire_status["extinguisher"] = "ACTIVATED"
+    fire_status["extinguisher"] = "ACTIVE"
 
 
-    if (
-        not fire_status["notification_sent"]
-        and owner["fcm_token"]
-    ):
+    # IMPORTANT:
+    # Test Fire sends ONLY to the device that pressed
+    # the Test Fire button.
 
-        success = send_notification(
-            owner["fcm_token"]
-        )
+    if test_token:
 
-        if success:
+        notification_ok =
+            send_notification(
+                test_token
+            )
 
-            fire_status[
-                "notification_sent"
-            ] = True
+    else:
+
+        notification_ok = False
+
+
+    fire_status[
+        "notification_sent"
+    ] = notification_ok
 
 
     return jsonify({
-
         "success": True,
-
         "message":
-            "Test fire activated."
-
+            "Test fire processed.",
+        "notification_sent":
+            notification_ok
     })
 
 
-# ============================================================
+# =========================================================
 # RESET
-# ============================================================
+# =========================================================
 
 @app.route("/api/reset", methods=["POST"])
 def reset():
 
-    fire_status["fire"] = False
+    global fire_status
 
-    fire_status["flame"] = "SAFE"
+    fire_status = {
 
-    fire_status["temperature"] = 0
+        "fire": False,
 
-    fire_status["extinguisher"] = "OFF"
+        "flame":
+            "NOT DETECTED",
 
-    fire_status["notification_sent"] = False
+        "temperature":
+            0,
+
+        "extinguisher":
+            "READY",
+
+        "notification_sent":
+            False
+
+    }
 
 
     return jsonify({
-
         "success": True,
-
-        "message":
-            "System reset successfully."
-
+        "message": "System reset."
     })
 
 
-# ============================================================
+# =========================================================
 # RUN
-# ============================================================
+# =========================================================
 
 if __name__ == "__main__":
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            5000
+    app.run(
+        host="0.0.0.0",
+        port=int(
+            os.environ.get(
+                "PORT",
+                5000
+            )
+        )
+    )
