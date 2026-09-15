@@ -1,4 +1,4 @@
- from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string
 import os, json
 import firebase_admin
 from firebase_admin import credentials, messaging
