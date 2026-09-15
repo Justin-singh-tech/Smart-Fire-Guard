@@ -1,452 +1,812 @@
-from flask import Flask, request, jsonify, render_template_string
-import os, json
+import os
+from datetime import datetime, timezone
+from functools import wraps
+
+from flask import Flask, jsonify, request
+from dotenv import load_dotenv
+
 import firebase_admin
-from firebase_admin import credentials, messaging
+from firebase_admin import credentials, firestore, auth, messaging
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+load_dotenv()
 
 app = Flask(__name__)
 
-# ---------- Firebase ----------
-firebase_ready = False
-
-try:
-    key = os.getenv("FIREBASE_SERVICE_ACCOUNT")
-    if key:
-        cred = credentials.Certificate(json.loads(key))
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(cred)
-        firebase_ready = True
-except Exception as e:
-    print("Firebase error:", e)
-
-# ---------- Data ----------
-owner = {}
-tokens = set()
-
-status = {
-    "fire": False,
-    "flame": "NOT DETECTED",
-    "temperature": 0,
-    "extinguisher": "READY",
-    "notification_sent": False
-}
-
-# ---------- Notification ----------
-def send_alert(token, title, body):
-    if not firebase_ready:
-        return False
-
-    try:
-        msg = messaging.Message(
-            notification=messaging.Notification(
-                title=title,
-                body=body
-            ),
-            token=token
-        )
-        messaging.send(msg)
-        return True
-    except Exception as e:
-        print("Notification error:", e)
-        tokens.discard(token)
-        return False
-
-
-def notify_all():
-    sent = False
-
-    for token in list(tokens):
-        if send_alert(
-            token,
-            "🔥 FIRE ALERT!",
-            "Smart Fire Guard detected a possible fire."
-        ):
-            sent = True
-
-    return sent
-
-
-# ---------- Service Worker ----------
-@app.route("/firebase-messaging-sw.js")
-def service_worker():
-    return """
-importScripts(
-"https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js");
-importScripts(
-"https://www.gstatic.com/firebasejs/10.13.2/firebase-messaging-compat.js");
-
-firebase.initializeApp({
- apiKey:"AIzaSyD1JM4e0Ztg3FUhCkA4tYh8UzEOYcdn9k",
- authDomain:"smart-fire-project.firebaseapp.com",
- projectId:"smart-fire-project",
- storageBucket:"smart-fire-project.firebasestorage.app",
- messagingSenderId:"591246962485",
- appId:"1:591246962485:web:2030ebe6c34a81f5bd667c"
-});
-
-const messaging=firebase.messaging();
-
-messaging.onBackgroundMessage(p=>{
- const n=p.notification||{};
- self.registration.showNotification(
-   n.title||"🔥 Smart Fire Guard",
-   {body:n.body||"Fire alert received."}
- );
-});
-""", 200, {"Content-Type": "application/javascript"}
-
-
-# ---------- Website ----------
-HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Smart Fire Guard</title>
-
-<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-messaging-compat.js"></script>
-
-<style>
-body{
-font-family:Arial;
-background:#101522;
-color:white;
-text-align:center;
-padding:20px;
-}
-.card{
-max-width:600px;
-margin:15px auto;
-padding:20px;
-background:#1b2335;
-border-radius:15px;
-}
-input,button{
-width:90%;
-padding:12px;
-margin:6px;
-border-radius:8px;
-border:0;
-}
-button{
-background:#ff5636;
-color:white;
-font-weight:bold;
-}
-.safe{color:#55ff88}
-.fire{color:#ff6045}
-</style>
-</head>
-
-<body>
-
-<h1>🔥 SMART FIRE GUARD</h1>
-
-<div id="register" class="card">
-<h2>👤 Owner Registration</h2>
-
-<input id="name" placeholder="Owner Name">
-<input id="phone" placeholder="Phone Number">
-<input id="email" placeholder="Email">
-<input id="location" placeholder="Location">
-<input id="device" placeholder="Device ID">
+SERVICE_ACCOUNT = os.getenv(
+    "FIREBASE_SERVICE_ACCOUNT",
+    "serviceAccountKey.json"
+)
 
-<button onclick="register()">Register</button>
-</div>
+ESP_API_KEY = os.getenv(
+    "ESP_API_KEY",
+    "CHANGE_THIS_KEY"
+)
 
 
-<div id="dashboard" class="card" style="display:none">
+# ============================================================
+# FIREBASE INITIALIZATION
+# ============================================================
 
-<h2>📊 Fire Guard Dashboard</h2>
+if not firebase_admin._apps:
 
-<h2 id="main" class="safe">SYSTEM SAFE</h2>
+    cred = credentials.Certificate(
+        SERVICE_ACCOUNT
+    )
 
-<p>🔥 Flame: <b id="flame">NOT DETECTED</b></p>
-<p>🌡️ Temperature: <b id="temp">0 °C</b></p>
-<p>🚿 Extinguisher: <b id="pump">READY</b></p>
-<p>🔔 Notification: <b id="notification">READY</b></p>
+    firebase_admin.initialize_app(
+        cred
+    )
 
-<hr>
 
-<h3>👤 Owner</h3>
-<p id="owner"></p>
+db = firestore.client()
 
-<button onclick="enableNotifications()">
-🔔 Enable Notifications
-</button>
 
-<button onclick="testFire()">
-🧪 Test Fire
-</button>
+# ============================================================
+# HELPERS
+# ============================================================
 
-<button onclick="resetFire()">
-🔄 Reset
-</button>
+def now():
+    return datetime.now(timezone.utc)
 
-</div>
 
+def get_bearer_token():
 
-<script>
+    header = request.headers.get(
+        "Authorization",
+        ""
+    )
 
-const config={
-apiKey:"AIzaSyD1JM4e0Ztg3FUhCkA4tYh8UzEOYcdn9k",
-authDomain:"smart-fire-project.firebaseapp.com",
-projectId:"smart-fire-project",
-storageBucket:"smart-fire-project.firebasestorage.app",
-messagingSenderId:"591246962485",
-appId:"1:591246962485:web:2030ebe6c34a81f5bd667c"
-};
+    if not header.startswith("Bearer "):
+        return None
 
-firebase.initializeApp(config);
-const messaging=firebase.messaging();
+    return header.split(
+        "Bearer ",
+        1
+    )[1].strip()
 
-/* PUT YOUR EXISTING VAPID KEY HERE */
-const vapidKey="BDMQ6bqrix1EQOm7fOuz-PBd_jHarjFNl3WrQtmFYVg72scD_rwzvLleIwVw0jJ9JXAxrlb0ygUSquZBWYBLm4I";
 
+def authenticated(function):
 
-function register(){
+    @wraps(function)
+    def wrapper(*args, **kwargs):
 
-let data={
-name:document.getElementById("name").value,
-phone:document.getElementById("phone").value,
-email:document.getElementById("email").value,
-location:document.getElementById("location").value,
-device_id:document.getElementById("device").value
-};
+        token = get_bearer_token()
 
-if(!data.name||!data.phone){
-alert("Enter name and phone");
-return;
-}
+        if not token:
 
-localStorage.setItem(
-"owner",
-JSON.stringify(data)
-);
+            return jsonify({
+                "success": False,
+                "error": "Login required"
+            }), 401
 
-fetch("/register",{
-method:"POST",
-headers:{"Content-Type":"application/json"},
-body:JSON.stringify(data)
-});
+        try:
 
-showDashboard(data);
-}
+            decoded = auth.verify_id_token(
+                token
+            )
 
+            request.firebase_user = decoded
 
-function showDashboard(data){
+            return function(
+                *args,
+                **kwargs
+            )
 
-document.getElementById("register").style.display="none";
-document.getElementById("dashboard").style.display="block";
+        except Exception as error:
 
-document.getElementById("owner").innerText=
-data.name+" | "+data.phone;
+            print("Authentication error:", error)
 
-updateStatus();
-}
+            return jsonify({
+                "success": False,
+                "error": "Invalid or expired login"
+            }), 401
 
+    return wrapper
 
-async function enableNotifications(){
 
-try{
+def current_uid():
 
-let permission=await Notification.requestPermission();
+    return request.firebase_user["uid"]
 
-if(permission!="granted"){
-alert("Notification permission denied");
-return;
-}
 
-let reg=await navigator.serviceWorker.register(
-"/firebase-messaging-sw.js"
-);
+def user_ref(uid):
 
-let token=await messaging.getToken({
-vapidKey:vapidKey,
-serviceWorkerRegistration:reg
-});
+    return db.collection(
+        "users"
+    ).document(uid)
 
-if(token){
 
-localStorage.setItem("fcm",token);
+def device_ref(device_id):
 
-await fetch("/save-fcm-token",{
-method:"POST",
-headers:{"Content-Type":"application/json"},
-body:JSON.stringify({token:token})
-});
+    return db.collection(
+        "esp_devices"
+    ).document(device_id)
 
-alert("🔔 Notifications enabled!");
 
-}
-
-}catch(e){
-console.log(e);
-alert("Notification setup failed");
-}
-}
-
-
-async function testFire(){
-
-let token=localStorage.getItem("fcm")||"";
-
-await fetch("/api/test-fire",{
-method:"POST",
-headers:{"Content-Type":"application/json"},
-body:JSON.stringify({token:token})
-});
-
-updateStatus();
-}
-
-
-async function resetFire(){
-
-await fetch("/api/reset",{method:"POST"});
-updateStatus();
-}
-
-
-async function updateStatus(){
-
-let r=await fetch("/status");
-let d=await r.json();
-
-document.getElementById("flame").innerText=d.flame;
-document.getElementById("temp").innerText=d.temperature+" °C";
-document.getElementById("pump").innerText=d.extinguisher;
-document.getElementById("notification").innerText=
-d.notification_sent?"SENT":"READY";
-
-let main=document.getElementById("main");
-
-if(d.fire){
-main.innerText="🔥 FIRE DETECTED";
-main.className="fire";
-}else{
-main.innerText="SYSTEM SAFE";
-main.className="safe";
-}
-}
-
-
-let saved=localStorage.getItem("owner");
-
-if(saved){
-showDashboard(JSON.parse(saved));
-}
-
-setInterval(updateStatus,3000);
-
-</script>
-
-</body>
-</html>
-"""
-
+# ============================================================
+# BASIC TEST
+# ============================================================
 
 @app.route("/")
 def home():
-    return render_template_string(HTML)
-
-
-# ---------- Register ----------
-@app.route("/register", methods=["POST"])
-def register_owner():
-    global owner
-    owner = request.get_json() or {}
-    return jsonify({"success": True})
-
-
-# ---------- FCM Token ----------
-@app.route("/save-fcm-token", methods=["POST"])
-def save_token():
-    data = request.get_json() or {}
-    token = data.get("token")
-
-    if not token:
-        return jsonify({"success": False}), 400
-
-    tokens.add(token)
 
     return jsonify({
         "success": True,
-        "devices": len(tokens)
+        "message": "Fire Detection API is running",
+        "version": "1.0"
     })
 
 
-# ---------- Status ----------
-@app.route("/status")
-def get_status():
-    return jsonify(status)
+@app.route("/api/health")
+def health():
+
+    return jsonify({
+        "success": True,
+        "server": "online"
+    })
 
 
-# ---------- ESP8266 ----------
-@app.route("/api/fire", methods=["POST"])
-def fire_api():
+# ============================================================
+# USER PROFILE
+# ============================================================
 
-    data = request.get_json() or {}
+@app.route(
+    "/api/profile",
+    methods=["GET"]
+)
+@authenticated
+def get_profile():
 
-    fire = bool(data.get("fire", True))
+    uid = current_uid()
 
-    status["fire"] = fire
-    status["flame"] = data.get(
-        "flame",
-        "DETECTED" if fire else "NOT DETECTED"
-    )
-    status["temperature"] = data.get("temperature", 0)
-    status["extinguisher"] = "ACTIVE" if fire else "READY"
-    status["notification_sent"] = False
+    document = user_ref(uid).get()
 
-    if fire:
-        status["notification_sent"] = notify_all()
+    if not document.exists:
 
-    return jsonify(status)
+        profile = {
+            "uid": uid,
+            "email":
+                request.firebase_user.get(
+                    "email",
+                    ""
+                ),
+            "name": "",
+            "phone": "",
+            "createdAt": now()
+        }
+
+        user_ref(uid).set(
+            profile
+        )
+
+        return jsonify({
+            "success": True,
+            "profile": profile
+        })
+
+    return jsonify({
+        "success": True,
+        "profile": document.to_dict()
+    })
 
 
-# ---------- Test ----------
-@app.route("/api/test-fire", methods=["POST"])
-def test_fire():
+@app.route(
+    "/api/profile",
+    methods=["POST"]
+)
+@authenticated
+def update_profile():
 
-    data = request.get_json() or {}
-    token = data.get("token")
+    uid = current_uid()
 
-    status["fire"] = True
-    status["flame"] = "TEST FIRE"
-    status["temperature"] = 50
-    status["extinguisher"] = "TEST MODE"
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    name = str(
+        data.get(
+            "name",
+            ""
+        )
+    ).strip()
+
+    phone = str(
+        data.get(
+            "phone",
+            ""
+        )
+    ).strip()
+
+    if len(name) > 100:
+
+        return jsonify({
+            "success": False,
+            "error": "Name is too long"
+        }), 400
+
+    if len(phone) > 30:
+
+        return jsonify({
+            "success": False,
+            "error": "Phone number is too long"
+        }), 400
+
+    user_ref(uid).set({
+
+        "uid": uid,
+
+        "email":
+            request.firebase_user.get(
+                "email",
+                ""
+            ),
+
+        "name": name,
+
+        "phone": phone,
+
+        "updatedAt": now()
+
+    }, merge=True)
+
+    return jsonify({
+        "success": True,
+        "message": "Profile updated"
+    })
+
+
+# ============================================================
+# FCM NOTIFICATION TOKEN
+# ============================================================
+
+@app.route(
+    "/api/notification-token",
+    methods=["POST"]
+)
+@authenticated
+def register_notification_token():
+
+    uid = current_uid()
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    token = str(
+        data.get(
+            "token",
+            ""
+        )
+    ).strip()
+
+    if not token:
+
+        return jsonify({
+            "success": False,
+            "error": "FCM token is required"
+        }), 400
+
+    if len(token) > 5000:
+
+        return jsonify({
+            "success": False,
+            "error": "Invalid token"
+        }), 400
+
+    user_ref(uid).set({
+
+        "notificationTokens":
+            firestore.ArrayUnion([
+                token
+            ]),
+
+        "updatedAt": now()
+
+    }, merge=True)
+
+    return jsonify({
+        "success": True,
+        "message": "Notification device registered"
+    })
+
+
+@app.route(
+    "/api/notification-token",
+    methods=["DELETE"]
+)
+@authenticated
+def remove_notification_token():
+
+    uid = current_uid()
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    token = str(
+        data.get(
+            "token",
+            ""
+        )
+    ).strip()
 
     if token:
-        tokens.add(token)
-        status["notification_sent"] = send_alert(
-            token,
-            "🧪 TEST FIRE ALERT",
-            "Smart Fire Guard test notification."
-        )
-    else:
-        status["notification_sent"] = False
 
-    return jsonify(status)
+        user_ref(uid).set({
 
+            "notificationTokens":
+                firestore.ArrayRemove([
+                    token
+                ])
 
-# ---------- Reset ----------
-@app.route("/api/reset", methods=["POST"])
-def reset():
+        }, merge=True)
 
-    status.update({
-        "fire": False,
-        "flame": "NOT DETECTED",
-        "temperature": 0,
-        "extinguisher": "READY",
-        "notification_sent": False
+    return jsonify({
+        "success": True
     })
 
-    return jsonify(status)
 
+# ============================================================
+# ESP DEVICE REGISTRATION
+# ============================================================
+
+@app.route(
+    "/api/esp/register",
+    methods=["POST"]
+)
+@authenticated
+def register_esp():
+
+    uid = current_uid()
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    device_id = str(
+        data.get(
+            "device_id",
+            ""
+        )
+    ).strip()
+
+    device_name = str(
+        data.get(
+            "device_name",
+            "Fire Sensor"
+        )
+    ).strip()
+
+    if not device_id:
+
+        return jsonify({
+            "success": False,
+            "error": "device_id is required"
+        }), 400
+
+    if len(device_id) > 100:
+
+        return jsonify({
+            "success": False,
+            "error": "Invalid device ID"
+        }), 400
+
+    device_ref(device_id).set({
+
+        "device_id": device_id,
+
+        "device_name": device_name,
+
+        "owner_uid": uid,
+
+        "fire": False,
+
+        "online": True,
+
+        "last_seen": now(),
+
+        "created_at": now()
+
+    }, merge=True)
+
+    return jsonify({
+        "success": True,
+        "message": "ESP registered",
+        "device_id": device_id
+    })
+
+
+@app.route(
+    "/api/esp/devices",
+    methods=["GET"]
+)
+@authenticated
+def get_my_devices():
+
+    uid = current_uid()
+
+    query = db.collection(
+        "esp_devices"
+    ).where(
+        "owner_uid",
+        "==",
+        uid
+    ).stream()
+
+    devices = []
+
+    for document in query:
+
+        data = document.to_dict()
+
+        devices.append(data)
+
+    return jsonify({
+        "success": True,
+        "devices": devices
+    })
+
+
+# ============================================================
+# ESP AUTHENTICATION
+# ============================================================
+
+def esp_authenticated():
+
+    key = request.headers.get(
+        "X-ESP-KEY",
+        ""
+    )
+
+    return (
+        key and
+        key == ESP_API_KEY
+    )
+
+
+# ============================================================
+# SEND FIRE NOTIFICATION
+# ============================================================
+
+def send_fire_notification(
+    owner_uid,
+    device_id
+):
+
+    document = user_ref(
+        owner_uid
+    ).get()
+
+    if not document.exists:
+        return 0
+
+    user_data = document.to_dict()
+
+    tokens = user_data.get(
+        "notificationTokens",
+        []
+    )
+
+    if not tokens:
+        return 0
+
+    successful = 0
+
+    invalid_tokens = []
+
+    for token in tokens:
+
+        message = messaging.Message(
+
+            notification=
+                messaging.Notification(
+
+                    title=
+                        "🔥 FIRE DETECTED!",
+
+                    body=
+                        "Fire has been detected by your ESP device."
+                ),
+
+            data={
+
+                "type": "fire",
+
+                "status": "detected",
+
+                "device_id":
+                    str(device_id)
+            },
+
+            token=token
+        )
+
+        try:
+
+            messaging.send(
+                message
+            )
+
+            successful += 1
+
+        except Exception as error:
+
+            print(
+                "FCM error:",
+                error
+            )
+
+            invalid_tokens.append(
+                token
+            )
+
+
+    # Remove tokens that are no longer valid.
+
+    if invalid_tokens:
+
+        user_ref(
+            owner_uid
+        ).set({
+
+            "notificationTokens":
+                firestore.ArrayRemove(
+                    invalid_tokens
+                )
+
+        }, merge=True)
+
+
+    return successful
+
+
+# ============================================================
+# ESP FIRE STATUS
+# ============================================================
+
+@app.route(
+    "/api/esp/status",
+    methods=["POST"]
+)
+def esp_status():
+
+    if not esp_authenticated():
+
+        return jsonify({
+            "success": False,
+            "error": "Unauthorized ESP"
+        }), 401
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    device_id = str(
+        data.get(
+            "device_id",
+            ""
+        )
+    ).strip()
+
+    fire = bool(
+        data.get(
+            "fire",
+            False
+        )
+    )
+
+    if not device_id:
+
+        return jsonify({
+            "success": False,
+            "error": "device_id is required"
+        }), 400
+
+
+    reference = device_ref(
+        device_id
+    )
+
+    document = reference.get()
+
+    if not document.exists:
+
+        return jsonify({
+            "success": False,
+            "error": "ESP device not registered"
+        }), 404
+
+
+    device = document.to_dict()
+
+    owner_uid = device.get(
+        "owner_uid"
+    )
+
+    if not owner_uid:
+
+        return jsonify({
+            "success": False,
+            "error": "Device has no owner"
+        }), 400
+
+
+    old_fire = bool(
+        device.get(
+            "fire",
+            False
+        )
+    )
+
+
+    reference.set({
+
+        "fire": fire,
+
+        "online": True,
+
+        "last_seen": now(),
+
+        "last_status":
+            "FIRE"
+            if fire
+            else "NORMAL"
+
+    }, merge=True)
+
+
+    # Notify only when the system changes
+    # from NORMAL to FIRE.
+
+    notification_sent = 0
+
+    if fire and not old_fire:
+
+        notification_sent = \
+            send_fire_notification(
+                owner_uid,
+                device_id
+            )
+
+
+    return jsonify({
+
+        "success": True,
+
+        "device_id":
+            device_id,
+
+        "fire":
+            fire,
+
+        "notification_sent":
+            notification_sent
+    })
+
+
+# ============================================================
+# GET ESP STATUS
+# ============================================================
+
+@app.route(
+    "/api/esp/status/<device_id>",
+    methods=["GET"]
+)
+@authenticated
+def get_esp_status(
+    device_id
+):
+
+    uid = current_uid()
+
+    document = device_ref(
+        device_id
+    ).get()
+
+    if not document.exists:
+
+        return jsonify({
+            "success": False,
+            "error": "Device not found"
+        }), 404
+
+    device = document.to_dict()
+
+    if device.get(
+        "owner_uid"
+    ) != uid:
+
+        return jsonify({
+            "success": False,
+            "error": "Access denied"
+        }), 403
+
+    return jsonify({
+        "success": True,
+        "device": device
+    })
+
+
+# ============================================================
+# RESET FIRE STATUS
+# ============================================================
+
+@app.route(
+    "/api/esp/reset/<device_id>",
+    methods=["POST"]
+)
+@authenticated
+def reset_fire(
+    device_id
+):
+
+    uid = current_uid()
+
+    reference = device_ref(
+        device_id
+    )
+
+    document = reference.get()
+
+    if not document.exists:
+
+        return jsonify({
+            "success": False,
+            "error": "Device not found"
+        }), 404
+
+
+    device = document.to_dict()
+
+    if device.get(
+        "owner_uid"
+    ) != uid:
+
+        return jsonify({
+            "success": False,
+            "error": "Access denied"
+        }), 403
+
+
+    reference.set({
+
+        "fire": False,
+
+        "last_status":
+            "NORMAL",
+
+        "reset_at":
+            now()
+
+    }, merge=True)
+
+
+    return jsonify({
+        "success": True,
+        "message": "Fire status reset"
+    })
+
+
+# ============================================================
+# SERVER RUN
+# ============================================================
 
 if __name__ == "__main__":
+
+    port = int(
+        os.getenv(
+            "PORT",
+            "5000"
+        )
+    )
+
     app.run(
         host="0.0.0.0",
-        port=int(os.getenv("PORT",5000))
-    )
+        port=port,
+        debug=True
+        )
