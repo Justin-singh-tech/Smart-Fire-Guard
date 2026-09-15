@@ -656,8 +656,7 @@ def send_fire_notification(
                 notification=
                     messaging.Notification(
 
-                        title:
-                            "🔥 FIRE DETECTED!",
+                        title = "🔥 FIRE DETECTED!",
 
                         body:
                             "Your Smart Fire Guard "
