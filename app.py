@@ -1,22 +1,20 @@
 import os
 import json
-from datetime import datetime, timezone
 from functools import wraps
 
-from flask import Flask, jsonify, request
-
+from flask import Flask, request, jsonify, render_template
 import firebase_admin
-from firebase_admin import credentials
-from firebase_admin import firestore
-from firebase_admin import auth
-from firebase_admin import messaging
+from firebase_admin import credentials, firestore, auth, messaging
 
 
 # ============================================================
-# FLASK APP
+# APP CONFIGURATION
 # ============================================================
 
 app = Flask(__name__)
+
+PORT = int(os.environ.get("PORT", 10000))
+ESP_API_KEY = os.environ.get("ESP_API_KEY", "").strip()
 
 
 # ============================================================
@@ -24,186 +22,313 @@ app = Flask(__name__)
 # ============================================================
 
 def initialize_firebase():
+    """
+    Reads the Firebase Admin service-account JSON from Render.
 
-    # Accept either Render variable name.
+    Render variable can be named either:
+        FIREBASE_SERVICE_ACCOUNT
+    or:
+        FIREBASE_SERVICE_ACCOUNT_JSON
+    """
+
+    if firebase_admin._apps:
+        return
+
     firebase_json = (
         os.environ.get("FIREBASE_SERVICE_ACCOUNT")
-        or
-        os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+        or os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
     )
 
     if not firebase_json:
         raise RuntimeError(
-            "FIREBASE_SERVICE_ACCOUNT is missing "
-            "from Render Environment Variables"
+            "Firebase service account environment variable is missing. "
+            "Set FIREBASE_SERVICE_ACCOUNT in Render."
         )
-
-    # Sometimes JSON is accidentally pasted with
-    # surrounding spaces/new lines.
-    firebase_json = firebase_json.strip()
 
     try:
-        service_account = json.loads(firebase_json)
-
-    except json.JSONDecodeError as error:
-
+        service_account_info = json.loads(firebase_json)
+    except json.JSONDecodeError as e:
         raise RuntimeError(
-            "Firebase service-account JSON is invalid"
-        ) from error
+            "FIREBASE_SERVICE_ACCOUNT contains invalid JSON."
+        ) from e
 
-    if not firebase_admin._apps:
-
-        firebase_credential = credentials.Certificate(
-            service_account
-        )
-
-        firebase_admin.initialize_app(
-            firebase_credential
-        )
+    try:
+        cred = credentials.Certificate(service_account_info)
+        firebase_admin.initialize_app(cred)
+    except Exception as e:
+        raise RuntimeError(
+            f"Firebase initialization failed: {e}"
+        ) from e
 
 
 initialize_firebase()
-
 db = firestore.client()
 
 
 # ============================================================
-# ESP API KEY
+# BASIC HELPERS
 # ============================================================
 
-ESP_API_KEY = os.environ.get(
-    "ESP_API_KEY",
-    ""
-).strip()
-
-if not ESP_API_KEY:
-
-    raise RuntimeError(
-        "ESP_API_KEY is missing from Render "
-        "Environment Variables"
-    )
+def json_error(message, status=400):
+    return jsonify({
+        "success": False,
+        "error": message
+    }), status
 
 
-# ============================================================
-# TIME
-# ============================================================
+def json_success(data=None, status=200):
+    response = {
+        "success": True
+    }
 
-def current_time():
+    if data:
+        response.update(data)
 
-    return datetime.now(
-        timezone.utc
-    )
+    return jsonify(response), status
 
-
-# ============================================================
-# FIREBASE AUTHENTICATION
-# ============================================================
 
 def get_bearer_token():
+    header = request.headers.get("Authorization", "")
 
-    authorization = request.headers.get(
-        "Authorization",
-        ""
-    )
-
-    if not authorization.startswith(
-        "Bearer "
-    ):
+    if not header.startswith("Bearer "):
         return None
 
-    return authorization[
-        7:
-    ].strip()
+    return header[7:].strip()
 
 
-def authenticated(function):
+def get_current_user():
+    token = get_bearer_token()
 
+    if not token:
+        return None
+
+    try:
+        decoded_token = auth.verify_id_token(token)
+        return decoded_token
+    except Exception:
+        return None
+
+
+def login_required(function):
     @wraps(function)
     def wrapper(*args, **kwargs):
+        user = get_current_user()
 
-        token = get_bearer_token()
-
-        if not token:
-
-            return jsonify({
-                "success": False,
-                "error": "Login required"
-            }), 401
-
-        try:
-
-            decoded_token = auth.verify_id_token(
-                token
+        if not user:
+            return json_error(
+                "Authentication required.",
+                401
             )
 
-            request.firebase_user = decoded_token
-
-            return function(
-                *args,
-                **kwargs
-            )
-
-        except Exception as error:
-
-            print(
-                "Authentication error:",
-                error
-            )
-
-            return jsonify({
-                "success": False,
-                "error":
-                    "Invalid or expired login"
-            }), 401
+        return function(user, *args, **kwargs)
 
     return wrapper
 
 
-def get_current_uid():
+def esp_key_required(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        if not ESP_API_KEY:
+            return json_error(
+                "ESP_API_KEY is not configured on the server.",
+                500
+            )
 
-    return request.firebase_user["uid"]
+        supplied_key = request.headers.get("X-ESP-KEY", "")
+
+        if supplied_key != ESP_API_KEY:
+            return json_error(
+                "Invalid ESP API key.",
+                401
+            )
+
+        return function(*args, **kwargs)
+
+    return wrapper
+
+
+def convert_fire_value(value):
+    """
+    Converts common ESP8266 values into True/False.
+    """
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, int):
+        return value != 0
+
+    if isinstance(value, str):
+        value = value.strip().lower()
+
+        if value in [
+            "true",
+            "1",
+            "yes",
+            "fire",
+            "detected",
+            "on"
+        ]:
+            return True
+
+        if value in [
+            "false",
+            "0",
+            "no",
+            "normal",
+            "off"
+        ]:
+            return False
+
+    return False
 
 
 # ============================================================
-# FIRESTORE REFERENCES
+# FCM NOTIFICATION
 # ============================================================
 
-def user_ref(uid):
+def send_fire_notification(uid, device_id):
+    """
+    Sends the fire notification only to FCM tokens belonging
+    to the Firebase user who owns this ESP device.
+    """
 
-    return db.collection(
-        "users"
-    ).document(uid)
+    user_ref = db.collection("users").document(uid)
+    user_doc = user_ref.get()
 
+    if not user_doc.exists:
+        return {
+            "sent": 0,
+            "removed": 0
+        }
 
-def esp_ref(device_id):
+    user_data = user_doc.to_dict() or {}
 
-    return db.collection(
-        "esp_devices"
-    ).document(device_id)
+    tokens = user_data.get("notificationTokens", [])
+
+    if not isinstance(tokens, list):
+        tokens = []
+
+    tokens = list(dict.fromkeys(
+        str(token).strip()
+        for token in tokens
+        if str(token).strip()
+    ))
+
+    if not tokens:
+        return {
+            "sent": 0,
+            "removed": 0
+        }
+
+    sent_count = 0
+    removed_tokens = []
+
+    for token in tokens:
+        try:
+            message = messaging.Message(
+                notification=messaging.Notification(
+                    title="🔥 FIRE ALERT",
+                    body=f"Fire detected by device {device_id}."
+                ),
+                data={
+                    "type": "fire_alert",
+                    "device_id": str(device_id),
+                    "fire": "true"
+                },
+                token=token
+            )
+
+            messaging.send(message)
+            sent_count += 1
+
+        except messaging.UnregisteredError:
+            removed_tokens.append(token)
+
+        except messaging.SenderIdMismatchError:
+            removed_tokens.append(token)
+
+        except Exception as e:
+            # One bad token should not stop notifications
+            # for other devices.
+            print(f"FCM error: {e}")
+
+    if removed_tokens:
+        try:
+            updated_tokens = [
+                token for token in tokens
+                if token not in removed_tokens
+            ]
+
+            user_ref.set(
+                {
+                    "notificationTokens": updated_tokens
+                },
+                merge=True
+            )
+        except Exception as e:
+            print(f"Could not clean old FCM tokens: {e}")
+
+    return {
+        "sent": sent_count,
+        "removed": len(removed_tokens)
+    }
 
 
 # ============================================================
-# BASIC ROUTES
+# HOME / FRONTEND
 # ============================================================
 
 @app.route("/")
 def home():
+    """
+    Loads templates/index.html if it exists.
+    """
 
-    return jsonify({
-        "success": True,
-        "name": "Smart Fire Guard",
-        "message":
-            "Fire detection server is running",
-        "status": "online"
-    })
+    try:
+        return render_template("index.html")
+    except Exception:
+        return jsonify({
+            "name": "Smart Fire Guard",
+            "status": "online",
+            "message": "Backend is running."
+        })
 
 
-@app.route("/api/health")
+@app.route("/dashboard")
+def dashboard():
+    try:
+        return render_template("dashboard.html")
+    except Exception:
+        return jsonify({
+            "success": True,
+            "message": "Dashboard endpoint is working."
+        })
+
+
+@app.route("/profile")
+def profile_page():
+    try:
+        return render_template("profile.html")
+    except Exception:
+        return jsonify({
+            "success": True,
+            "message": "Profile endpoint is working."
+        })
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.route("/api/health", methods=["GET"])
 def health():
-
     return jsonify({
         "success": True,
-        "status": "online"
+        "service": "Smart Fire Guard",
+        "status": "online",
+        "firebase": bool(firebase_admin._apps),
+        "esp_api_key_configured": bool(ESP_API_KEY)
     })
 
 
@@ -211,828 +336,519 @@ def health():
 # USER PROFILE
 # ============================================================
 
-@app.route(
-    "/api/profile",
-    methods=["GET"]
-)
-@authenticated
-def get_profile():
+@app.route("/api/profile", methods=["GET"])
+@login_required
+def get_profile(user):
+    uid = user["uid"]
 
-    uid = get_current_uid()
+    try:
+        doc = db.collection("users").document(uid).get()
 
-    reference = user_ref(uid)
+        if not doc.exists:
+            return json_success({
+                "profile": {
+                    "uid": uid,
+                    "email": user.get("email", ""),
+                    "displayName": user.get("name", ""),
+                    "phone": "",
+                    "address": ""
+                }
+            })
 
-    document = reference.get()
+        data = doc.to_dict() or {}
 
-    if not document.exists:
+        # Do not expose notification tokens to frontend.
+        data.pop("notificationTokens", None)
 
-        profile = {
+        data["uid"] = uid
 
-            "uid": uid,
+        if "email" not in data:
+            data["email"] = user.get("email", "")
 
-            "email":
-                request.firebase_user.get(
-                    "email",
-                    ""
-                ),
-
-            "name": "",
-
-            "phone": "",
-
-            "createdAt":
-                current_time()
-        }
-
-        reference.set(
-            profile
-        )
-
-        return jsonify({
-            "success": True,
-            "profile": profile
+        return json_success({
+            "profile": data
         })
 
-    return jsonify({
-
-        "success": True,
-
-        "profile":
-            document.to_dict()
-    })
-
-
-@app.route(
-    "/api/profile",
-    methods=["POST"]
-)
-@authenticated
-def update_profile():
-
-    uid = get_current_uid()
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    name = str(
-        data.get(
-            "name",
-            ""
+    except Exception as e:
+        return json_error(
+            f"Could not load profile: {e}",
+            500
         )
-    ).strip()
 
-    phone = str(
-        data.get(
-            "phone",
-            ""
+
+@app.route("/api/profile", methods=["POST"])
+@login_required
+def save_profile(user):
+    uid = user["uid"]
+
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return json_error("Invalid JSON data.")
+
+    allowed_fields = [
+        "displayName",
+        "phone",
+        "address",
+        "city",
+        "state",
+        "emergencyContact"
+    ]
+
+    profile = {}
+
+    for field in allowed_fields:
+        if field in data:
+            profile[field] = str(data[field]).strip()
+
+    profile["uid"] = uid
+    profile["email"] = user.get("email", "")
+    profile["updatedAt"] = firestore.SERVER_TIMESTAMP
+
+    try:
+        db.collection("users").document(uid).set(
+            profile,
+            merge=True
         )
-    ).strip()
 
-    if len(name) > 100:
+        return json_success({
+            "message": "Profile saved successfully."
+        })
 
-        return jsonify({
-            "success": False,
-            "error": "Name is too long"
-        }), 400
-
-    if len(phone) > 30:
-
-        return jsonify({
-            "success": False,
-            "error": "Phone number is too long"
-        }), 400
-
-    user_ref(uid).set({
-
-        "uid": uid,
-
-        "email":
-            request.firebase_user.get(
-                "email",
-                ""
-            ),
-
-        "name": name,
-
-        "phone": phone,
-
-        "updatedAt":
-            current_time()
-
-    }, merge=True)
-
-    return jsonify({
-
-        "success": True,
-
-        "message":
-            "Profile saved successfully"
-    })
+    except Exception as e:
+        return json_error(
+            f"Could not save profile: {e}",
+            500
+        )
 
 
 # ============================================================
-# FCM NOTIFICATION DEVICE TOKEN
+# FCM DEVICE TOKEN
 # ============================================================
 
-@app.route(
-    "/api/notification-token",
-    methods=["POST"]
-)
-@authenticated
-def add_notification_token():
+@app.route("/api/notification-token", methods=["POST"])
+@login_required
+def save_notification_token(user):
+    uid = user["uid"]
 
-    uid = get_current_uid()
+    data = request.get_json(silent=True)
 
-    data = request.get_json(
-        silent=True
-    ) or {}
+    if not isinstance(data, dict):
+        return json_error("Invalid JSON data.")
 
-    token = str(
-        data.get(
-            "token",
-            ""
-        )
-    ).strip()
+    token = str(data.get("token", "")).strip()
 
     if not token:
+        return json_error("FCM token is required.")
 
-        return jsonify({
-            "success": False,
-            "error":
-                "FCM token is required"
-        }), 400
+    user_ref = db.collection("users").document(uid)
 
-    if len(token) > 5000:
+    try:
+        user_doc = user_ref.get()
 
-        return jsonify({
-            "success": False,
-            "error":
-                "Invalid FCM token"
-        }), 400
+        if user_doc.exists:
+            user_data = user_doc.to_dict() or {}
+            tokens = user_data.get("notificationTokens", [])
 
-    user_ref(uid).set({
+            if not isinstance(tokens, list):
+                tokens = []
+        else:
+            tokens = []
 
-        "notificationTokens":
-            firestore.ArrayUnion([
-                token
-            ]),
+        if token not in tokens:
+            tokens.append(token)
 
-        "updatedAt":
-            current_time()
-
-    }, merge=True)
-
-    return jsonify({
-
-        "success": True,
-
-        "message":
-            "This device is registered for notifications"
-    })
-
-
-@app.route(
-    "/api/notification-token",
-    methods=["DELETE"]
-)
-@authenticated
-def remove_notification_token():
-
-    uid = get_current_uid()
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    token = str(
-        data.get(
-            "token",
-            ""
+        user_ref.set(
+            {
+                "uid": uid,
+                "email": user.get("email", ""),
+                "notificationTokens": tokens,
+                "updatedAt": firestore.SERVER_TIMESTAMP
+            },
+            merge=True
         )
-    ).strip()
 
-    if token:
+        return json_success({
+            "message": "Notification token saved."
+        })
 
-        user_ref(uid).set({
+    except Exception as e:
+        return json_error(
+            f"Could not save notification token: {e}",
+            500
+        )
 
-            "notificationTokens":
-                firestore.ArrayRemove([
-                    token
-                ])
 
-        }, merge=True)
+@app.route("/api/notification-token", methods=["DELETE"])
+@login_required
+def delete_notification_token(user):
+    uid = user["uid"]
 
-    return jsonify({
-        "success": True,
-        "message":
-            "Notification device removed"
-    })
+    data = request.get_json(silent=True) or {}
+
+    token = str(data.get("token", "")).strip()
+
+    if not token:
+        return json_error("FCM token is required.")
+
+    user_ref = db.collection("users").document(uid)
+
+    try:
+        doc = user_ref.get()
+
+        if not doc.exists:
+            return json_success({
+                "message": "Token was not registered."
+            })
+
+        user_data = doc.to_dict() or {}
+
+        tokens = user_data.get("notificationTokens", [])
+
+        if not isinstance(tokens, list):
+            tokens = []
+
+        tokens = [
+            item for item in tokens
+            if item != token
+        ]
+
+        user_ref.set(
+            {
+                "notificationTokens": tokens
+            },
+            merge=True
+        )
+
+        return json_success({
+            "message": "Notification token removed."
+        })
+
+    except Exception as e:
+        return json_error(
+            f"Could not remove token: {e}",
+            500
+        )
 
 
 # ============================================================
 # ESP DEVICE REGISTRATION
 # ============================================================
 
-@app.route(
-    "/api/esp/register",
-    methods=["POST"]
-)
-@authenticated
-def register_esp():
+@app.route("/api/esp/register", methods=["POST"])
+@login_required
+def register_esp(user):
+    uid = user["uid"]
 
-    uid = get_current_uid()
+    data = request.get_json(silent=True)
 
-    data = request.get_json(
-        silent=True
-    ) or {}
+    if not isinstance(data, dict):
+        return json_error("Invalid JSON data.")
 
-    device_id = str(
-        data.get(
-            "device_id",
-            ""
-        )
-    ).strip()
-
-    device_name = str(
-        data.get(
-            "device_name",
-            "Fire Sensor"
-        )
-    ).strip()
+    device_id = str(data.get("device_id", "")).strip()
 
     if not device_id:
-
-        return jsonify({
-            "success": False,
-            "error":
-                "device_id is required"
-        }), 400
+        return json_error("device_id is required.")
 
     if len(device_id) > 100:
+        return json_error("device_id is too long.")
 
-        return jsonify({
-            "success": False,
-            "error":
-                "Invalid device ID"
-        }), 400
+    device_ref = db.collection("esp_devices").document(device_id)
 
-    reference = esp_ref(
-        device_id
-    )
+    try:
+        existing = device_ref.get()
 
-    existing = reference.get()
+        if existing.exists:
+            existing_data = existing.to_dict() or {}
+            existing_owner = existing_data.get("owner_uid")
 
-    # Don't allow User B to take User A's ESP.
-    if existing.exists:
+            if existing_owner and existing_owner != uid:
+                return json_error(
+                    "This ESP device already belongs to another user.",
+                    403
+                )
 
-        existing_data = existing.to_dict()
+        device_data = {
+            "device_id": device_id,
+            "owner_uid": uid,
+            "name": str(
+                data.get("name", device_id)
+            ).strip(),
+            "location": str(
+                data.get("location", "")
+            ).strip(),
+            "fire": False,
+            "status": "normal",
+            "registeredAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP
+        }
 
-        old_owner = existing_data.get(
-            "owner_uid"
+        if existing.exists:
+            device_data.pop("registeredAt", None)
+
+        device_ref.set(
+            device_data,
+            merge=True
         )
 
-        if old_owner != uid:
+        return json_success({
+            "message": "ESP8266 registered successfully.",
+            "device_id": device_id
+        })
 
-            return jsonify({
-                "success": False,
-                "error":
-                    "This ESP is already registered "
-                    "to another user"
-            }), 403
-
-    reference.set({
-
-        "device_id":
-            device_id,
-
-        "device_name":
-            device_name,
-
-        "owner_uid":
-            uid,
-
-        "fire":
-            False,
-
-        "online":
-            True,
-
-        "last_status":
-            "NORMAL",
-
-        "last_seen":
-            current_time(),
-
-        "updated_at":
-            current_time()
-
-    }, merge=True)
-
-    return jsonify({
-
-        "success": True,
-
-        "message":
-            "ESP registered successfully",
-
-        "device_id":
-            device_id
-    })
+    except Exception as e:
+        return json_error(
+            f"Could not register ESP device: {e}",
+            500
+        )
 
 
 # ============================================================
 # GET USER'S ESP DEVICES
 # ============================================================
 
-@app.route(
-    "/api/esp/devices",
-    methods=["GET"]
-)
-@authenticated
-def get_my_esp_devices():
+@app.route("/api/esp/devices", methods=["GET"])
+@login_required
+def get_user_devices(user):
+    uid = user["uid"]
 
-    uid = get_current_uid()
-
-    documents = db.collection(
-        "esp_devices"
-    ).where(
-        "owner_uid",
-        "==",
-        uid
-    ).stream()
-
-    devices = []
-
-    for document in documents:
-
-        data = document.to_dict()
-
-        data["id"] = document.id
-
-        devices.append(
-            data
+    try:
+        query = (
+            db.collection("esp_devices")
+            .where("owner_uid", "==", uid)
+            .stream()
         )
 
-    return jsonify({
+        devices = []
 
-        "success": True,
+        for document in query:
+            device = document.to_dict() or {}
+            device["id"] = document.id
 
-        "devices":
-            devices
-    })
+            devices.append(device)
 
+        return json_success({
+            "devices": devices
+        })
 
-# ============================================================
-# ESP AUTHENTICATION
-# ============================================================
-
-def authenticate_esp():
-
-    received_key = request.headers.get(
-        "X-ESP-KEY",
-        ""
-    ).strip()
-
-    return received_key == ESP_API_KEY
-
-
-# ============================================================
-# SEND FIRE NOTIFICATION
-# ============================================================
-
-def send_fire_notification(
-    owner_uid,
-    device_id
-):
-
-    reference = user_ref(
-        owner_uid
-    )
-
-    document = reference.get()
-
-    if not document.exists:
-
-        print(
-            "Notification user not found:",
-            owner_uid
+    except Exception as e:
+        return json_error(
+            f"Could not load devices: {e}",
+            500
         )
 
-        return 0
-
-    user_data = document.to_dict()
-
-    tokens = user_data.get(
-        "notificationTokens",
-        []
-    )
-
-    if not isinstance(
-        tokens,
-        list
-    ):
-
-        return 0
-
-    if not tokens:
-
-        print(
-            "No registered notification devices"
-        )
-
-        return 0
-
-    sent = 0
-
-    invalid_tokens = []
-
-    for token in tokens:
-
-        try:
-
-            message = messaging.Message(
-
-                notification=
-                    messaging.Notification(
-
-                        title = "🔥 FIRE DETECTED!",
-
-                        body:
-                            "Your Smart Fire Guard "
-                            "detected a possible fire."
-                    ),
-
-                data={
-
-                    "type":
-                        "fire",
-
-                    "status":
-                        "detected",
-
-                    "device_id":
-                        str(device_id)
-                },
-
-                token=token
-            )
-
-            messaging.send(
-                message
-            )
-
-            sent += 1
-
-        except messaging.UnregisteredError:
-
-            invalid_tokens.append(
-                token
-            )
-
-        except messaging.SenderIdMismatchError:
-
-            invalid_tokens.append(
-                token
-            )
-
-        except Exception as error:
-
-            print(
-                "FCM notification error:",
-                error
-            )
-
-
-    # Remove tokens that Firebase says
-    # are no longer usable.
-
-    if invalid_tokens:
-
-        reference.set({
-
-            "notificationTokens":
-                firestore.ArrayRemove(
-                    invalid_tokens
-                )
-
-        }, merge=True)
-
-
-    print(
-        "Notifications sent:",
-        sent
-    )
-
-    return sent
-
 
 # ============================================================
-# ESP FIRE STATUS
+# ESP8266 SENDS FIRE STATUS
 # ============================================================
 
-@app.route(
-    "/api/esp/status",
-    methods=["POST"]
-)
-def receive_esp_status():
+@app.route("/api/esp/status", methods=["POST"])
+@esp_key_required
+def esp_status():
+    data = request.get_json(silent=True)
 
-    if not authenticate_esp():
-
-        return jsonify({
-
-            "success": False,
-
-            "error":
-                "Unauthorized ESP"
-        }), 401
-
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
+    if not isinstance(data, dict):
+        return json_error("Invalid JSON data.")
 
     device_id = str(
-        data.get(
-            "device_id",
-            ""
-        )
+        data.get("device_id", "")
     ).strip()
 
-
-    fire_value = data.get(
-        "fire",
-        False
-    )
-
-
-    # Handle both JSON boolean and
-    # simple "true"/"false" strings.
-
-    if isinstance(
-        fire_value,
-        str
-    ):
-
-        fire = (
-            fire_value.lower()
-            in [
-                "true",
-                "1",
-                "yes",
-                "fire"
-            ]
-        )
-
-    else:
-
-        fire = bool(
-            fire_value
-        )
-
-
     if not device_id:
-
-        return jsonify({
-
-            "success": False,
-
-            "error":
-                "device_id is required"
-        }), 400
-
-
-    reference = esp_ref(
-        device_id
-    )
-
-    document = reference.get()
-
-
-    if not document.exists:
-
-        return jsonify({
-
-            "success": False,
-
-            "error":
-                "ESP is not registered"
-        }), 404
-
-
-    device = document.to_dict()
-
-
-    owner_uid = device.get(
-        "owner_uid"
-    )
-
-
-    if not owner_uid:
-
-        return jsonify({
-
-            "success": False,
-
-            "error":
-                "ESP has no owner"
-        }), 400
-
-
-    old_fire = bool(
-        device.get(
-            "fire",
-            False
+        return json_error(
+            "device_id is required."
         )
+
+    if len(device_id) > 100:
+        return json_error(
+            "device_id is too long."
+        )
+
+    fire = convert_fire_value(
+        data.get("fire", False)
     )
 
+    temperature = data.get("temperature")
+    smoke = data.get("smoke")
 
-    reference.set({
+    device_ref = db.collection(
+        "esp_devices"
+    ).document(device_id)
 
-        "fire":
-            fire,
+    try:
+        device_doc = device_ref.get()
 
-        "online":
-            True,
+        if not device_doc.exists:
+            return json_error(
+                "ESP device is not registered.",
+                404
+            )
 
-        "last_seen":
-            current_time(),
+        device_data = device_doc.to_dict() or {}
 
-        "last_status":
-            "FIRE"
-            if fire
-            else
-            "NORMAL",
+        owner_uid = device_data.get("owner_uid")
 
-        "updated_at":
-            current_time()
+        if not owner_uid:
+            return json_error(
+                "ESP device has no owner.",
+                400
+            )
 
-    }, merge=True)
+        old_fire = convert_fire_value(
+            device_data.get("fire", False)
+        )
 
+        update_data = {
+            "fire": fire,
+            "status": "fire" if fire else "normal",
+            "updatedAt": firestore.SERVER_TIMESTAMP
+        }
 
-    notification_count = 0
+        if temperature is not None:
+            update_data["temperature"] = temperature
 
+        if smoke is not None:
+            update_data["smoke"] = smoke
 
-    # Send notification only when the state
-    # changes from NORMAL to FIRE.
+        device_ref.set(
+            update_data,
+            merge=True
+        )
 
-    if fire and not old_fire:
+        notification_result = {
+            "sent": 0,
+            "removed": 0
+        }
 
-        notification_count = \
-            send_fire_notification(
+        # Send notification only when the state changes
+        # from normal -> fire.
+        if fire and not old_fire:
+            notification_result = send_fire_notification(
                 owner_uid,
                 device_id
             )
 
+        return json_success({
+            "message": "ESP status updated.",
+            "device_id": device_id,
+            "fire": fire,
+            "notification": notification_result
+        })
 
-    return jsonify({
-
-        "success":
-            True,
-
-        "device_id":
-            device_id,
-
-        "fire":
-            fire,
-
-        "notification_sent":
-            notification_count
-    })
+    except Exception as e:
+        return json_error(
+            f"Could not update ESP status: {e}",
+            500
+        )
 
 
 # ============================================================
-# GET ESP STATUS
+# GET ONE ESP STATUS
 # ============================================================
 
 @app.route(
     "/api/esp/status/<device_id>",
     methods=["GET"]
 )
-@authenticated
-def get_esp_status(
-    device_id
-):
+@login_required
+def get_esp_status(user, device_id):
+    uid = user["uid"]
 
-    uid = get_current_uid()
+    device_id = str(device_id).strip()
 
-    document = esp_ref(
-        device_id
-    ).get()
+    if not device_id:
+        return json_error(
+            "device_id is required."
+        )
 
+    try:
+        device_ref = db.collection(
+            "esp_devices"
+        ).document(device_id)
 
-    if not document.exists:
+        doc = device_ref.get()
 
-        return jsonify({
+        if not doc.exists:
+            return json_error(
+                "Device not found.",
+                404
+            )
 
-            "success": False,
+        device = doc.to_dict() or {}
 
-            "error":
-                "Device not found"
-        }), 404
+        if device.get("owner_uid") != uid:
+            return json_error(
+                "You do not have access to this device.",
+                403
+            )
 
+        device["id"] = doc.id
 
-    device = document.to_dict()
+        return json_success({
+            "device": device
+        })
 
-
-    if device.get(
-        "owner_uid"
-    ) != uid:
-
-        return jsonify({
-
-            "success": False,
-
-            "error":
-                "You do not own this ESP"
-        }), 403
-
-
-    return jsonify({
-
-        "success":
-            True,
-
-        "device":
-            device
-    })
+    except Exception as e:
+        return json_error(
+            f"Could not get device status: {e}",
+            500
+        )
 
 
 # ============================================================
-# RESET FIRE STATUS
+# RESET FIRE ALERT
 # ============================================================
 
 @app.route(
     "/api/esp/reset/<device_id>",
     methods=["POST"]
 )
-@authenticated
-def reset_fire_status(
-    device_id
-):
+@login_required
+def reset_fire(user, device_id):
+    uid = user["uid"]
 
-    uid = get_current_uid()
+    device_id = str(device_id).strip()
 
-    reference = esp_ref(
-        device_id
-    )
+    device_ref = db.collection(
+        "esp_devices"
+    ).document(device_id)
 
-    document = reference.get()
+    try:
+        doc = device_ref.get()
 
+        if not doc.exists:
+            return json_error(
+                "Device not found.",
+                404
+            )
 
-    if not document.exists:
+        device = doc.to_dict() or {}
 
-        return jsonify({
+        if device.get("owner_uid") != uid:
+            return json_error(
+                "You do not have access to this device.",
+                403
+            )
 
-            "success": False,
+        device_ref.set(
+            {
+                "fire": False,
+                "status": "normal",
+                "updatedAt": firestore.SERVER_TIMESTAMP
+            },
+            merge=True
+        )
 
-            "error":
-                "Device not found"
-        }), 404
+        return json_success({
+            "message": "Fire alert reset.",
+            "device_id": device_id
+        })
 
-
-    device = document.to_dict()
-
-
-    if device.get(
-        "owner_uid"
-    ) != uid:
-
-        return jsonify({
-
-            "success": False,
-
-            "error":
-                "You do not own this ESP"
-        }), 403
-
-
-    reference.set({
-
-        "fire":
-            False,
-
-        "last_status":
-            "NORMAL",
-
-        "reset_at":
-            current_time(),
-
-        "updated_at":
-            current_time()
-
-    }, merge=True)
-
-
-    return jsonify({
-
-        "success":
-            True,
-
-        "message":
-            "Fire status reset"
-    })
+    except Exception as e:
+        return json_error(
+            f"Could not reset alert: {e}",
+            500
+        )
 
 
 # ============================================================
@@ -1043,74 +859,171 @@ def reset_fire_status(
     "/api/esp/<device_id>",
     methods=["DELETE"]
 )
-@authenticated
-def delete_esp(
-    device_id
-):
+@login_required
+def delete_esp(user, device_id):
+    uid = user["uid"]
 
-    uid = get_current_uid()
+    device_id = str(device_id).strip()
 
-    reference = esp_ref(
-        device_id
-    )
+    device_ref = db.collection(
+        "esp_devices"
+    ).document(device_id)
 
-    document = reference.get()
+    try:
+        doc = device_ref.get()
 
+        if not doc.exists:
+            return json_error(
+                "Device not found.",
+                404
+            )
 
-    if not document.exists:
+        device = doc.to_dict() or {}
 
-        return jsonify({
+        if device.get("owner_uid") != uid:
+            return json_error(
+                "You do not have permission to delete this device.",
+                403
+            )
 
-            "success": False,
+        device_ref.delete()
 
-            "error":
-                "Device not found"
-        }), 404
+        return json_success({
+            "message": "ESP device deleted."
+        })
 
-
-    device = document.to_dict()
-
-
-    if device.get(
-        "owner_uid"
-    ) != uid:
-
-        return jsonify({
-
-            "success": False,
-
-            "error":
-                "You do not own this ESP"
-        }), 403
-
-
-    reference.delete()
-
-
-    return jsonify({
-
-        "success":
-            True,
-
-        "message":
-            "ESP removed successfully"
-    })
+    except Exception as e:
+        return json_error(
+            f"Could not delete device: {e}",
+            500
+        )
 
 
 # ============================================================
-# RENDER SERVER
+# TEST NOTIFICATION
+# ============================================================
+
+@app.route(
+    "/api/test-notification",
+    methods=["POST"]
+)
+@login_required
+def test_notification(user):
+    """
+    Sends a test notification only to the currently
+    logged-in user's registered browser/device tokens.
+    """
+
+    uid = user["uid"]
+
+    user_ref = db.collection(
+        "users"
+    ).document(uid)
+
+    try:
+        doc = user_ref.get()
+
+        if not doc.exists:
+            return json_error(
+                "User profile not found.",
+                404
+            )
+
+        data = doc.to_dict() or {}
+
+        tokens = data.get(
+            "notificationTokens",
+            []
+        )
+
+        if not isinstance(tokens, list):
+            tokens = []
+
+        sent = 0
+        removed = []
+
+        for token in tokens:
+            try:
+                message = messaging.Message(
+                    notification=messaging.Notification(
+                        title="🔥 Smart Fire Guard",
+                        body="Test notification received successfully."
+                    ),
+                    data={
+                        "type": "test"
+                    },
+                    token=token
+                )
+
+                messaging.send(message)
+                sent += 1
+
+            except messaging.UnregisteredError:
+                removed.append(token)
+
+            except messaging.SenderIdMismatchError:
+                removed.append(token)
+
+            except Exception as e:
+                print(f"Test FCM error: {e}")
+
+        if removed:
+            tokens = [
+                token for token in tokens
+                if token not in removed
+            ]
+
+            user_ref.set(
+                {
+                    "notificationTokens": tokens
+                },
+                merge=True
+            )
+
+        return json_success({
+            "message": "Test notification processed.",
+            "sent": sent,
+            "removed": len(removed)
+        })
+
+    except Exception as e:
+        return json_error(
+            f"Could not send test notification: {e}",
+            500
+        )
+
+
+# ============================================================
+# 404 HANDLER
+# ============================================================
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({
+        "success": False,
+        "error": "Route not found."
+    }), 404
+
+
+# ============================================================
+# 500 HANDLER
+# ============================================================
+
+@app.errorhandler(500)
+def server_error(error):
+    return jsonify({
+        "success": False,
+        "error": "Internal server error."
+    }), 500
+
+
+# ============================================================
+# START SERVER
 # ============================================================
 
 if __name__ == "__main__":
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            "5000"
-        )
-    )
-
     app.run(
         host="0.0.0.0",
-        port=port
+        port=PORT,
+        debug=False
     )
